@@ -90,17 +90,24 @@ void StoreStateMachine::HandlePutIfAbsentRequest(StoreClosure* done, const pb::r
 
   butil::Status status;
   auto writer = engine_->NewWriter(request.cf_name());
+  std::vector<std::string> put_keys;  // NOLINT
   if (request.kvs().size() == 1) {
     status = writer->KvPutIfAbsent(request.kvs().Get(0));
   } else {
-    std::vector<std::string> put_keys;
-    status = writer->KvBatchPutIfAbsent(Helper::PbRepeatedToVector(request.kvs()), put_keys, true);
+    status = writer->KvBatchPutIfAbsent(Helper::PbRepeatedToVector(request.kvs()), put_keys, request.is_atomic());
   }
 
   if (done != nullptr) {
     std::shared_ptr<Context> ctx = done->GetCtx();
     if (ctx) {
       ctx->SetStatus(status);
+      if (request.kvs().size() != 1) {
+        for (const auto& key : put_keys) {
+          const_cast<::dingodb::pb::error::Error&>(
+              (dynamic_cast<pb::store::KvBatchPutIfAbsentResponse*>(ctx->Response()))->error())
+              .add_failed_keys(key);
+        }
+      }
     }
   }
 }

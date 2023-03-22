@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <optional>
@@ -704,7 +705,11 @@ butil::Status RawRocksEngine::Writer::KvBatchPutIfAbsent(const std::vector<pb::c
       LOG(ERROR) << butil::StringPrintf("empty key not support");
       return butil::Status(pb::error::EKEY_EMPTY, "Key is empty");
     }
+    // assuming all keys fail
+    put_keys.emplace_back(kv.key());
   }
+
+  std::vector<std::string> put_keys_copy = put_keys;
 
   rocksdb::WriteOptions write_options;
   rocksdb::TransactionOptions txn_options;
@@ -726,7 +731,8 @@ butil::Status RawRocksEngine::Writer::KvBatchPutIfAbsent(const std::vector<pb::c
                                            rocksdb::Slice(kvs[i].key().data(), kvs[i].key().size()), &value_old);
     if (is_atomic) {
       if (!s.IsNotFound()) {
-        put_keys.clear();
+        // put_keys.clear();
+        put_keys = put_keys_copy;
         utxn->Rollback();
         LOG(INFO) << butil::StringPrintf("rocksdb::TransactionDB::GetForUpdate failed : %s", s.ToString().c_str());
         return butil::Status(pb::error::EINTERNAL, "Internal error");
@@ -742,17 +748,28 @@ butil::Status RawRocksEngine::Writer::KvBatchPutIfAbsent(const std::vector<pb::c
     s = utxn->Put(column_family_->GetHandle(), rocksdb::Slice(kvs[i].key().data(), kvs[i].key().size()),
                   rocksdb::Slice(kvs[i].value().data(), kvs[i].value().size()));
     if (!s.ok()) {
-      if (is_atomic) put_keys.clear();
+      if (is_atomic) {
+        put_keys = put_keys_copy; /*put_keys.clear();*/
+      }
       utxn->Rollback();
       LOG(ERROR) << butil::StringPrintf("rocksdb::TransactionDB::Put failed : %s", s.ToString().c_str());
       return butil::Status(pb::error::EINTERNAL, "Internal error");
     }
-    put_keys.push_back(kvs[i].key());
+
+    for (auto iter = put_keys.begin(); iter != put_keys.end(); ++iter) {
+      if (kvs[i].key() == *iter) {
+        put_keys.erase(iter);
+        break;
+      }
+    }
+
+    // (void)std::remove(put_keys.begin(), put_keys.end(), kvs[i].key());
   }
 
   rocksdb::Status s = utxn->Commit();
   if (!s.ok()) {
-    put_keys.clear();
+    // put_keys.clear();
+    put_keys = put_keys_copy;
     LOG(ERROR) << butil::StringPrintf("rocksdb::TransactionDB::Commit failed : %s", s.ToString().c_str());
     return butil::Status(pb::error::EINTERNAL, "Internal error");
   }
