@@ -60,4 +60,5 @@ message Error {
   string errmsg = 2;
 
   dingodb.pb.common.Location leader_location = 3;
+  repeated bytes failed_keys = 4;
 }

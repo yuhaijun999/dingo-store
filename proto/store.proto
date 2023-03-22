@@ -96,6 +96,7 @@ message KvPutIfAbsentResponse {
 message KvBatchPutIfAbsentRequest {
   uint64 region_id = 1;
   repeated dingodb.pb.common.KeyValue kvs = 2;
+  bool is_atomic = 3;
 }
 
 message KvBatchPutIfAbsentResponse {
