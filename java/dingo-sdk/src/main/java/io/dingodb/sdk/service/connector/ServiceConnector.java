@@ -105,6 +105,7 @@ public abstract class ServiceConnector<S extends AbstractBlockingStub<S>> {
                 if (channel != null) {
                     stub = newStub(channel);
                     channelRef.compareAndSet(null, channel);
+                    return stub != null;
                 }
             } catch (Exception e) {
                 log.warn("Connect {} and transform to leader error.", location, e);
