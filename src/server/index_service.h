@@ -50,6 +50,11 @@ class IndexServiceImpl : public pb::index::IndexService {
                           ::dingodb::pb::index::VectorCalcDistanceResponse* response,
                           ::google::protobuf::Closure* done) override;
 
+  // for debug
+  void VectorSearchDebug(google::protobuf::RpcController* controller,
+                         const pb::index::VectorSearchDebugRequest* request,
+                         pb::index::VectorSearchDebugResponse* response, google::protobuf::Closure* done) override;
+
   void SetStorage(std::shared_ptr<Storage> storage);
 
  private:
@@ -60,6 +65,7 @@ class IndexServiceImpl : public pb::index::IndexService {
   butil::Status ValidateVectorGetBorderIdRequest(const dingodb::pb::index::VectorGetBorderIdRequest* request);
   butil::Status ValidateVectorScanQueryRequest(const dingodb::pb::index::VectorScanQueryRequest* request);
   butil::Status ValidateVectorGetRegionMetricsRequest(const dingodb::pb::index::VectorGetRegionMetricsRequest* request);
+  butil::Status ValidateVectorSearchDebugRequest(const dingodb::pb::index::VectorSearchDebugRequest* request);
   std::shared_ptr<Storage> storage_;
 };
 

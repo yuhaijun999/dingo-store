@@ -385,6 +385,9 @@ butil::Status RaftStoreEngine::VectorReader::SearchVector(
           }
 
           new_vector_with_distance_result.add_vector_with_distances()->Swap(&temp_vector_with_distance);
+          if (new_vector_with_distance_result.vector_with_distances_size() >= parameter.top_n()) {
+            break;
+          }
         }
 
         vector_with_distance_results.emplace_back(std::move(new_vector_with_distance_result));
@@ -781,6 +784,42 @@ butil::Status RaftStoreEngine::VectorReader::VectorGetRegionMetrics(std::shared_
   return butil::Status();
 }
 
+butil::Status RaftStoreEngine::VectorReader::VectorBatchSearchDebug(
+    std::shared_ptr<Context> ctx, const std::vector<pb::common::VectorWithId>& vector_with_ids,
+    pb::common::VectorSearchParameter parameter, std::vector<pb::index::VectorWithDistanceResult>& results,
+    int64_t& deserialization_id_time_us, int64_t& scan_scalar_time_us, int64_t& search_time_us) {
+  if (vector_with_ids.empty()) {
+    DINGO_LOG(WARNING) << "VectorBatchSearch: vector_with_ids is empty";
+    return butil::Status::OK();
+  }
+
+  // Search vectors by vectors
+  auto status = SearchVectorDebug(ctx->RegionId(), vector_with_ids, parameter, results, deserialization_id_time_us,
+                                  scan_scalar_time_us, search_time_us);
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (parameter.with_scalar_data()) {
+    // Get scalar data by parameter
+    std::vector<std::string> selected_scalar_keys = Helper::PbRepeatedToVector(parameter.selected_keys());
+    auto status = QueryVectorScalarData(ctx->RegionId(), selected_scalar_keys, results);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  if (parameter.with_table_data()) {
+    // Get table data by parameter
+    auto status = QueryVectorTableData(ctx->RegionId(), results);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  return butil::Status();
+}
+
 // GetBorderId
 butil::Status RaftStoreEngine::VectorReader::GetBorderId(uint64_t region_id, uint64_t& border_id, bool get_min) {
   std::string start_key;
@@ -1052,6 +1091,254 @@ butil::Status RaftStoreEngine::VectorReader::DoVectorSearchForTableCoprocessor(
   std::string s = fmt::format("vector index search table filter for coprocessor not support now !!! ");
   DINGO_LOG(ERROR) << s;
   return butil::Status(pb::error::Errno::EVECTOR_NOT_SUPPORT, s);
+}
+
+butil::Status RaftStoreEngine::VectorReader::SearchVectorDebug(
+    uint64_t region_id, const std::vector<pb::common::VectorWithId>& vector_with_ids,
+    pb::common::VectorSearchParameter parameter,
+    std::vector<pb::index::VectorWithDistanceResult>& vector_with_distance_results, int64_t& deserialization_id_time_us,
+    int64_t& scan_scalar_time_us, int64_t& search_time_us) {
+  auto vector_index = Server::GetInstance()->GetVectorIndexManager()->GetVectorIndex(region_id);
+  if (vector_index == nullptr) {
+    return butil::Status(pb::error::EVECTOR_INDEX_NOT_FOUND, fmt::format("Not found vector index {}", region_id));
+  }
+
+  if (vector_with_ids.empty()) {
+    DINGO_LOG(WARNING) << "Empty vector with ids";
+    return butil::Status();
+  }
+
+  uint32_t top_n = parameter.top_n();
+  bool use_scalar_filter = parameter.use_scalar_filter();
+
+  dingodb::pb::common::VectorFilter vector_filter = parameter.vector_filter();
+  dingodb::pb::common::VectorFilterType vector_filter_type = parameter.vector_filter_type();
+
+  auto lambda_time_now_function = []() { return std::chrono::steady_clock::now(); };
+  auto lambda_time_diff_microseconds_function = [](auto start, auto end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  };
+
+  if (use_scalar_filter) {
+    if (dingodb::pb::common::VectorFilter::SCALAR_FILTER == vector_filter &&
+        dingodb::pb::common::VectorFilterType::QUERY_POST == vector_filter_type) {
+      if (BAIDU_UNLIKELY(vector_with_ids[0].scalar_data().scalar_data_size() == 0)) {
+        return butil::Status(
+            pb::error::EVECTOR_SCALAR_DATA_NOT_FOUND,
+            fmt::format("Not found vector scalar data, region: {}, vector id: {}", region_id, vector_with_ids[0].id()));
+      }
+      top_n *= 10;
+    }
+  }
+
+  bool with_vector_data = !(parameter.without_vector_data());
+  std::vector<pb::index::VectorWithDistanceResult> tmp_results;
+
+  if (use_scalar_filter) {
+    // scalar post filter
+    if (dingodb::pb::common::VectorFilter::SCALAR_FILTER == vector_filter &&
+        dingodb::pb::common::VectorFilterType::QUERY_POST == vector_filter_type) {
+      auto start = lambda_time_now_function();
+      vector_index->Search(vector_with_ids, top_n, tmp_results, with_vector_data);
+      auto end = lambda_time_now_function();
+      search_time_us = lambda_time_diff_microseconds_function(start, end);
+      for (auto& vector_with_distance_result : tmp_results) {
+        pb::index::VectorWithDistanceResult new_vector_with_distance_result;
+
+        for (auto& temp_vector_with_distance : *vector_with_distance_result.mutable_vector_with_distances()) {
+          uint64_t temp_id = temp_vector_with_distance.vector_with_id().id();
+          bool compare_result = false;
+          butil::Status status =
+              CompareVectorScalarData(region_id, temp_id, vector_with_ids[0].scalar_data(), compare_result);
+          if (!status.ok()) {
+            return status;
+          }
+          if (!compare_result) {
+            continue;
+          }
+
+          new_vector_with_distance_result.add_vector_with_distances()->Swap(&temp_vector_with_distance);
+          if (new_vector_with_distance_result.vector_with_distances_size() >= parameter.top_n()) {
+            break;
+          }
+        }
+
+        vector_with_distance_results.emplace_back(std::move(new_vector_with_distance_result));
+      }
+    } else if (dingodb::pb::common::VectorFilter::VECTOR_ID_FILTER == vector_filter) {  // vector id array search
+      butil::Status status = DoVectorSearchForVectorIdPreFilterDebug(vector_index, region_id, vector_with_ids,
+                                                                     parameter, vector_with_distance_results,
+                                                                     deserialization_id_time_us, search_time_us);
+      if (!status.ok()) {
+        DINGO_LOG(ERROR) << fmt::format("DoVectorSearchForVectorIdPreFilterDebug failed ");
+        return status;
+      }
+
+    } else if (dingodb::pb::common::VectorFilter::SCALAR_FILTER == vector_filter &&
+               dingodb::pb::common::VectorFilterType::QUERY_PRE == vector_filter_type) {  // scalar pre filter search
+
+      butil::Status status =
+          DoVectorSearchForScalarPreFilterDebug(vector_index, region_id, vector_with_ids, parameter,
+                                                vector_with_distance_results, scan_scalar_time_us, search_time_us);
+      if (!status.ok()) {
+        DINGO_LOG(ERROR) << fmt::format("DoVectorSearchForScalarPreFilter failed ");
+        return status;
+      }
+
+    } else if (dingodb::pb::common::VectorFilter::TABLE_FILTER ==
+               vector_filter) {  //  table coprocessor pre filter search. not impl
+      butil::Status status = DoVectorSearchForTableCoprocessor(vector_index, region_id, vector_with_ids, parameter,
+                                                               vector_with_distance_results);
+      if (!status.ok()) {
+        DINGO_LOG(ERROR) << fmt::format("DoVectorSearchForTableCoprocessor failed ");
+        return status;
+      }
+    }
+  } else {  // no filter
+    vector_index->Search(vector_with_ids, top_n, tmp_results, with_vector_data);
+    vector_with_distance_results.swap(tmp_results);
+  }
+
+  // if vector index does not support restruct vector ,we restruct it using RocksDB
+  if (with_vector_data) {
+    for (auto& result : vector_with_distance_results) {
+      for (auto& vector_with_distance : *result.mutable_vector_with_distances()) {
+        if (vector_with_distance.vector_with_id().vector().float_values_size() > 0 ||
+            vector_with_distance.vector_with_id().vector().binary_values_size() > 0) {
+          continue;
+        }
+
+        pb::common::VectorWithId vector_with_id;
+        auto status = QueryVectorWithId(region_id, vector_with_distance.vector_with_id().id(), vector_with_id);
+        if (!status.ok()) {
+          return status;
+        }
+        vector_with_distance.mutable_vector_with_id()->Swap(&vector_with_id);
+      }
+    }
+  }
+
+  return butil::Status();
+}
+
+butil::Status RaftStoreEngine::VectorReader::DoVectorSearchForVectorIdPreFilterDebug(
+    std::shared_ptr<VectorIndex> vector_index, [[maybe_unused]] uint64_t region_id,
+    const std::vector<pb::common::VectorWithId>& vector_with_ids, const pb::common::VectorSearchParameter& parameter,
+    std::vector<pb::index::VectorWithDistanceResult>& vector_with_distance_results, int64_t& deserialization_id_time_us,
+    int64_t& search_time_us) {
+  uint32_t top_n = parameter.top_n();
+  bool with_vector_data = !(parameter.without_vector_data());
+
+  auto lambda_time_now_function = []() { return std::chrono::steady_clock::now(); };
+  auto lambda_time_diff_microseconds_function = [](auto start, auto end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  };
+
+  const ::google::protobuf::RepeatedField<uint64_t>& vector_ids = parameter.vector_ids();
+  auto start_ids = lambda_time_now_function();
+  std::vector<uint64_t> internal_vector_ids(vector_ids.begin(), vector_ids.end());
+  auto end_ids = lambda_time_now_function();
+  deserialization_id_time_us = lambda_time_diff_microseconds_function(start_ids, end_ids);
+
+  auto start_search = lambda_time_now_function();
+  butil::Status status =
+      vector_index->Search(vector_with_ids, top_n, vector_with_distance_results, with_vector_data, internal_vector_ids);
+  auto end_search = lambda_time_now_function();
+  search_time_us = lambda_time_diff_microseconds_function(start_search, end_search);
+  if (!status.ok()) {
+    std::string s = fmt::format("DoVectorSearchForVectorIdPreFilter::VectorIndex::Search failed");
+    DINGO_LOG(ERROR) << s;
+    return status;
+  }
+
+  return butil::Status::OK();
+}
+
+butil::Status RaftStoreEngine::VectorReader::DoVectorSearchForScalarPreFilterDebug(
+    std::shared_ptr<VectorIndex> vector_index, uint64_t region_id,
+    const std::vector<pb::common::VectorWithId>& vector_with_ids, const pb::common::VectorSearchParameter& parameter,
+    std::vector<pb::index::VectorWithDistanceResult>& vector_with_distance_results, int64_t& scan_scalar_time_us,
+    int64_t& search_time_us) {
+  // scalar pre filter search
+
+  uint32_t top_n = parameter.top_n();
+  bool with_vector_data = !(parameter.without_vector_data());
+
+  std::vector<uint64_t> vector_ids;
+  vector_ids.reserve(1024);
+  std::string start_key;
+  std::string end_key;
+  VectorCodec::EncodeVectorScalar(region_id, std::numeric_limits<uint64_t>::min(), start_key);
+  VectorCodec::EncodeVectorScalar(region_id, std::numeric_limits<uint64_t>::max(), end_key);
+
+  auto scalar_iter = reader_->NewIterator(start_key, end_key);
+
+  const auto& std_vector_scalar = vector_with_ids[0].scalar_data();
+  auto lambda_scalar_compare_function =
+      [&std_vector_scalar](const pb::common::VectorScalardata& internal_vector_scalar) {
+        for (const auto& [key, value] : std_vector_scalar.scalar_data()) {
+          auto it = internal_vector_scalar.scalar_data().find(key);
+          if (it == internal_vector_scalar.scalar_data().end()) {
+            return false;
+          }
+
+          bool compare_result = Helper::IsEqualVectorScalarValue(value, it->second);
+          if (!compare_result) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+  auto lambda_time_now_function = []() { return std::chrono::steady_clock::now(); };
+  auto lambda_time_diff_microseconds_function = [](auto start, auto end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  };
+
+  auto start_iter = lambda_time_now_function();
+  scalar_iter->Start();
+  while (scalar_iter->HasNext()) {
+    std::string key;
+    std::string value;
+    scalar_iter->GetKV(key, value);
+
+    uint64_t internal_vector_id = 0;
+
+    internal_vector_id = VectorCodec::DecodeVectorId(key);
+    if (0 == internal_vector_id) {
+      std::string s = fmt::format("VectorCodec::DecodeVectorId failed key : {}", Helper::StringToHex(key));
+      DINGO_LOG(ERROR) << s;
+      return butil::Status(pb::error::Errno::EVECTOR_NOT_SUPPORT, s);
+    }
+
+    pb::common::VectorScalardata internal_vector_scalar;
+    if (!internal_vector_scalar.ParseFromString(value)) {
+      return butil::Status(pb::error::EINTERNAL, "Internal error, decode VectorScalar failed");
+    }
+
+    bool compare_result = lambda_scalar_compare_function(internal_vector_scalar);
+    if (compare_result) {
+      vector_ids.push_back(internal_vector_id);
+    }
+
+    scalar_iter->Next();
+  }
+
+  auto end_iter = lambda_time_now_function();
+  scan_scalar_time_us = lambda_time_diff_microseconds_function(start_iter, end_iter);
+
+  auto start_search = lambda_time_now_function();
+  butil::Status status =
+      vector_index->Search(vector_with_ids, top_n, vector_with_distance_results, with_vector_data, vector_ids);
+  auto end_search = lambda_time_now_function();
+  search_time_us = lambda_time_diff_microseconds_function(start_search, end_search);
+  if (!status.ok()) {
+    std::string s = fmt::format("DoVectorSearchForScalarPreFilter::VectorIndex::Search failed");
+    DINGO_LOG(ERROR) << s;
+    return status;
+  }
+
+  return butil::Status::OK();
 }
 
 std::shared_ptr<Engine::VectorReader> RaftStoreEngine::NewVectorReader(const std::string& cf_name) {

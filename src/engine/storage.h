@@ -84,9 +84,16 @@ class Storage {
 
   butil::Status VectorCalcDistance(std::shared_ptr<Context> ctx, uint64_t region_id,
                                    const ::dingodb::pb::index::VectorCalcDistanceRequest& request,
-                                   std::vector<std::vector<float>>& distances,  // NOLINT
-                                   std::vector<::dingodb::pb::common::Vector>& result_op_left_vectors,  // NOLINT
+                                   std::vector<std::vector<float>>& distances,                            // NOLINT
+                                   std::vector<::dingodb::pb::common::Vector>& result_op_left_vectors,    // NOLINT
                                    std::vector<::dingodb::pb::common::Vector>& result_op_right_vectors);  // NOLINT
+
+  butil::Status VectorBatchSearchDebug(std::shared_ptr<Context> ctx,
+                                       const std::vector<pb::common::VectorWithId>& vector_with_ids,
+                                       const pb::common::VectorSearchParameter& parameter,
+                                       std::vector<pb::index::VectorWithDistanceResult>& results,
+                                       int64_t& deserialization_id_time_us, int64_t& scan_scalar_time_us,
+                                       int64_t& search_time_us);
 
   butil::Status ValidateLeader(uint64_t region_id);
 

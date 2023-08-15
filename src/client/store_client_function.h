@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_
+#ifndef DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_  // NOLINT
 #define DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_
 
 #include <cstdint>
@@ -49,6 +49,9 @@ dingodb::pb::common::Region SendQueryRegion(ServerInteractionPtr interaction, ui
 // vector
 void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
                       uint32_t topn);
+void SendVectorSearchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension,
+                           uint64_t start_vector_id, uint32_t topn, uint32_t batch_count, const std::string& key,
+                           const std::string& value);
 void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
                            uint32_t topn, uint32_t batch_count);
 void SendVectorBatchQuery(ServerInteractionPtr interaction, uint64_t region_id, std::vector<uint64_t> vector_ids);
@@ -59,6 +62,9 @@ void SendVectorGetMaxId(ServerInteractionPtr interaction, uint64_t region_id);
 void SendVectorGetMinId(ServerInteractionPtr interaction, uint64_t region_id);
 void SendVectorAddBatch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t count,
                         uint32_t step_count, int64_t start_id, const std::string& file);
+
+void SendVectorAddBatchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t count,
+                             uint32_t step_count, int64_t start_id, const std::string& file);
 void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, uint64_t start_id, uint64_t limit,
                          bool is_reverse);
 void SendVectorGetRegionMetrics(ServerInteractionPtr interaction, uint64_t region_id);

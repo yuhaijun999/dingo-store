@@ -654,4 +654,139 @@ void IndexServiceImpl::VectorCalcDistance(google::protobuf::RpcController* contr
   response->mutable_op_right_vectors()->Add(result_op_right_vectors.begin(), result_op_right_vectors.end());
 }
 
+butil::Status IndexServiceImpl::ValidateVectorSearchDebugRequest(
+    const dingodb::pb::index::VectorSearchDebugRequest* request) {
+  if (request->region_id() == 0) {
+    return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "Param region_id is error");
+  }
+
+  if (request->vector().id() == 0) {
+    if (request->vector().vector().float_values_size() == 0 && request->vector().vector().binary_values_size() == 0 &&
+        request->vector_with_ids().empty()) {
+      return butil::Status(pb::error::EVECTOR_EMPTY, "Vector is empty");
+    }
+  }
+
+  if (request->parameter().top_n() > FLAGS_vector_max_bactch_count) {
+    return butil::Status(pb::error::EVECTOR_EXCEED_MAX_BATCH_COUNT,
+                         fmt::format("Param top_n {} is exceed max batch count {}", request->parameter().top_n(),
+                                     FLAGS_vector_max_bactch_count));
+  }
+
+  // we limit the max request size to 4M and max batch count to 1024
+  // for response, the limit is 10 times of request, which may be 40M
+  // this size is less than the default max message size 64M
+  if (request->parameter().top_n() * request->vector_with_ids_size() > FLAGS_vector_max_bactch_count * 10) {
+    return butil::Status(pb::error::EVECTOR_EXCEED_MAX_BATCH_COUNT,
+                         fmt::format("Param top_n {} is exceed max batch count {}", request->parameter().top_n(),
+                                     FLAGS_vector_max_bactch_count));
+  }
+
+  if (request->parameter().top_n() < 0) {
+    return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "Param top_n is error");
+  }
+
+  auto status = storage_->ValidateLeader(request->region_id());
+  if (!status.ok()) {
+    return status;
+  }
+
+  auto vector_index = Server::GetInstance()->GetVectorIndexManager()->GetVectorIndex(request->region_id());
+  if (!vector_index) {
+    return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "Param region_id cannot find vector_index");
+  }
+
+  return ServiceHelper::ValidateIndexRegion(request->region_id());
+}
+
+void IndexServiceImpl::VectorSearchDebug(google::protobuf::RpcController* controller,
+                                         const pb::index::VectorSearchDebugRequest* request,
+                                         pb::index::VectorSearchDebugResponse* response,
+                                         google::protobuf::Closure* done) {
+  brpc::Controller* cntl = (brpc::Controller*)controller;
+  brpc::ClosureGuard done_guard(done);
+
+  DINGO_LOG(DEBUG) << "VectorSearchDebug request: " << request->ShortDebugString();
+
+  butil::Status status = ValidateVectorSearchDebugRequest(request);
+  if (!status.ok()) {
+    auto* err = response->mutable_error();
+    err->set_errcode(static_cast<Errno>(status.error_code()));
+    err->set_errmsg(status.error_str());
+    if (status.error_code() == pb::error::ERAFT_NOTLEADER) {
+      err->set_errmsg("Not leader, please redirect leader.");
+      ServiceHelper::RedirectLeader(status.error_str(), response);
+    }
+    DINGO_LOG(WARNING) << fmt::format("ValidateRequest failed request: {} response: {}", request->ShortDebugString(),
+                                      response->ShortDebugString());
+    return;
+  }
+
+  std::shared_ptr<Context> ctx = std::make_shared<Context>(cntl, done);
+  ctx->SetRegionId(request->region_id()).SetCfName(Constant::kStoreDataCF);
+
+  int64_t deserialization_id_time_us = 0;
+  int64_t scan_scalar_time_us = 0;
+  int64_t search_time_us = 0;
+
+  if (request->vector_with_ids_size() <= 0) {
+    std::vector<pb::common::VectorWithId> vector_with_ids;
+    vector_with_ids.push_back(request->vector());
+
+    std::vector<pb::index::VectorWithDistanceResult> vector_results;
+
+    status = storage_->VectorBatchSearchDebug(ctx, vector_with_ids, request->parameter(), vector_results,
+                                              deserialization_id_time_us, scan_scalar_time_us, search_time_us);
+    if (!status.ok()) {
+      auto* err = response->mutable_error();
+      err->set_errcode(static_cast<Errno>(status.error_code()));
+      err->set_errmsg(status.error_str());
+      if (status.error_code() == pb::error::ERAFT_NOTLEADER) {
+        err->set_errmsg("Not leader, please redirect leader.");
+        ServiceHelper::RedirectLeader(status.error_str(), response);
+      }
+      DINGO_LOG(ERROR) << fmt::format("VectorSearch request: {} response: {}", request->ShortDebugString(),
+                                      response->ShortDebugString());
+      return;
+    }
+
+    for (auto& vector_result : vector_results) {
+      response->add_batch_results()->CopyFrom(vector_result);
+    }
+    response->set_deserialization_id_time_us(deserialization_id_time_us);
+    response->set_scan_scalar_time_us(scan_scalar_time_us);
+    response->set_search_time_us(search_time_us);
+  } else {
+    std::vector<pb::common::VectorWithId> vector_with_ids;
+    for (const auto& vector : request->vector_with_ids()) {
+      vector_with_ids.push_back(vector);
+    }
+
+    std::vector<pb::index::VectorWithDistanceResult> vector_results;
+
+    status = storage_->VectorBatchSearchDebug(ctx, vector_with_ids, request->parameter(), vector_results,
+                                              deserialization_id_time_us, scan_scalar_time_us, search_time_us);
+    if (!status.ok()) {
+      auto* err = response->mutable_error();
+      err->set_errcode(static_cast<Errno>(status.error_code()));
+      err->set_errmsg(status.error_str());
+      if (status.error_code() == pb::error::ERAFT_NOTLEADER) {
+        err->set_errmsg("Not leader, please redirect leader.");
+        ServiceHelper::RedirectLeader(status.error_str(), response);
+      }
+      DINGO_LOG(ERROR) << fmt::format("VectorSearch request: {} response: {}", request->ShortDebugString(),
+                                      response->ShortDebugString());
+      return;
+    }
+
+    for (auto& vector_result : vector_results) {
+      response->add_batch_results()->CopyFrom(vector_result);
+    }
+  }
+
+  response->set_deserialization_id_time_us(deserialization_id_time_us);
+  response->set_scan_scalar_time_us(scan_scalar_time_us);
+  response->set_search_time_us(search_time_us);
+}
+
 }  // namespace dingodb

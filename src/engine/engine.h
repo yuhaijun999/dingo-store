@@ -96,6 +96,13 @@ class Engine {
                                           std::vector<pb::common::VectorWithId>& vector_with_ids) = 0;
     virtual butil::Status VectorGetRegionMetrics(std::shared_ptr<Context> ctx, uint64_t region_id,
                                                  pb::common::VectorIndexMetrics& region_metrics) = 0;
+
+    virtual butil::Status VectorBatchSearchDebug(std::shared_ptr<Context> ctx,
+                                                 const std::vector<pb::common::VectorWithId>& vector_with_ids,
+                                                 pb::common::VectorSearchParameter parameter,
+                                                 std::vector<pb::index::VectorWithDistanceResult>& results,
+                                                 int64_t& deserialization_id_time_us, int64_t& scan_scalar_time_us,
+                                                 int64_t& search_time_us) = 0;
   };
 
   virtual std::shared_ptr<Reader> NewReader(const std::string& cf_name) = 0;
