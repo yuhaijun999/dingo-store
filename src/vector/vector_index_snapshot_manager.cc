@@ -497,12 +497,20 @@ butil::Status VectorIndexSnapshotManager::SaveVectorIndexSnapshot(VectorIndexWra
     return butil::Status::OK();
   }
 
-  // if vector index not train. ignore
-  if (!vector_index->IsTrained()) {
-    DINGO_LOG(INFO) << fmt::format("[vector_index.save_snapshot][index_id({})] VectorIndex not train, skip save",
+  auto last_save_log_behind = vector_index_wrapper->ApplyLogId() - vector_index_wrapper->SnapshotLogId();
+  bool need_save = vector_index_wrapper->NeedToSave(last_save_log_behind);
+  if (!need_save) {
+    DINGO_LOG(INFO) << fmt::format("[vector_index.save_snapshot][index_id({})] VectorIndex not NeedToSave, skip save",
                                    vector_index_wrapper->Id());
     return butil::Status::OK();
   }
+
+  // // if vector index not train. ignore
+  // if (!vector_index->IsTrained()) {
+  //   DINGO_LOG(INFO) << fmt::format("[vector_index.save_snapshot][index_id({})] VectorIndex not train, skip save",
+  //                                  vector_index_wrapper->Id());
+  //   return butil::Status::OK();
+  // }
 
   int64_t vector_index_id = vector_index_wrapper->Id();
 

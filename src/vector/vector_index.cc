@@ -385,13 +385,6 @@ bool VectorIndexWrapper::NeedToSave(int64_t last_save_log_behind) {
     return false;
   }
 
-  if (SnapshotLogId() == 0) {
-    DINGO_LOG(INFO) << fmt::format(
-        "[vector_index.wrapper][index_id({})] vector index need_to_save=true: snapshot_log_id is 0", Id());
-    last_save_write_key_count_ = write_key_count_;
-    return true;
-  }
-
   bool ret = vector_index->NeedToSave(last_save_log_behind);
   if (ret) {
     DINGO_LOG(INFO) << fmt::format(
@@ -406,6 +399,13 @@ bool VectorIndexWrapper::NeedToSave(int64_t last_save_log_behind) {
         "0",
         Id());
     return ret;
+  }
+
+  if (SnapshotLogId() == 0) {
+    DINGO_LOG(INFO) << fmt::format(
+        "[vector_index.wrapper][index_id({})] vector index need_to_save=true: snapshot_log_id is 0", Id());
+    last_save_write_key_count_ = write_key_count_;
+    return true;
   }
 
   if ((write_key_count_ - last_save_write_key_count_) >= save_snapshot_threshold_write_key_num_) {
