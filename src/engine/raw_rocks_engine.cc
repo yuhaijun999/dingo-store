@@ -678,7 +678,7 @@ butil::Status Writer::KvBatchPutIfAbsent(ColumnFamilyPtr column_family, const st
         key_states.clear();
         key_states.resize(kvs.size(), false);
         DINGO_LOG(INFO) << fmt::format("[rocksdb] get failed, error: {}.", s.ToString());
-        return butil::Status(pb::error::EINTERNAL, "Internal get error");
+        return butil::Status(pb::error::ENOT_MEET_BUSINESS_NEEDS, "not meet business needs");
       }
     } else {
       if (!s.IsNotFound()) {
@@ -774,7 +774,7 @@ butil::Status Writer::KvBatchCompareAndSet(ColumnFamilyPtr column_family, const 
         key_states.clear();
         key_states.resize(kvs.size(), false);
         DINGO_LOG(ERROR) << fmt::format("[rocksdb] get failed, key_index({}) error: {}.", key_index, s.ToString());
-        return butil::Status(pb::error::EINTERNAL, "Internal get error");
+        return butil::Status(pb::error::ENOT_MEET_BUSINESS_NEEDS, "not meet business needs");
       }
     } else {
       if (s.ok()) {
@@ -965,12 +965,12 @@ butil::Status Writer::KvDeleteIfEqual(ColumnFamilyPtr column_family, const pb::c
       return butil::Status(pb::error::EKEY_NOT_FOUND, "Not found key");
     }
     DINGO_LOG(ERROR) << fmt::format("[rocksdb] get failed, error: {}.", s.ToString());
-    return butil::Status(pb::error::EINTERNAL, "Internal get error");
+    return butil::Status(pb::error::ENOT_MEET_BUSINESS_NEEDS, "not meet business needs");
   }
 
   if (kv.value() != old_value) {
     DINGO_LOG(WARNING) << fmt::format("[rocksdb] value is not equal, {} | {}.", kv.value(), old_value);
-    return butil::Status(pb::error::EINTERNAL, "Internal compare value error");
+    return butil::Status(pb::error::ENOT_MEET_BUSINESS_NEEDS, "Internal compare value error : not meet business needs");
   }
 
   // delete a key

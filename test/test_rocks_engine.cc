@@ -1271,7 +1271,7 @@ TEST_F(RawRocksEngineTest, KvBatchPutIfAbsentAtomic) {
     kvs.push_back(kv);
 
     butil::Status ok = writer->KvBatchPutIfAbsent(cf_name, kvs, key_states, true);
-    EXPECT_EQ(ok.error_code(), pb::error::Errno::EINTERNAL);
+    EXPECT_EQ(ok.error_code(), pb::error::Errno::ENOT_MEET_BUSINESS_NEEDS);
     EXPECT_EQ(kvs.size(), key_states.size());
 
     std::string value;
@@ -1913,7 +1913,7 @@ TEST_F(RawRocksEngineTest, KvDeleteIfEqual) {
     for (auto &kv : kvs) {
       kv.set_value("243fgdfgd");
       ok = writer->KvDeleteIfEqual(cf_name, kv);
-      EXPECT_EQ(ok.error_code(), pb::error::Errno::EINTERNAL);
+      EXPECT_EQ(ok.error_code(), pb::error::Errno::ENOT_MEET_BUSINESS_NEEDS);
     }
   }
 
