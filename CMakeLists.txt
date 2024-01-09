@@ -138,6 +138,7 @@ include(libbacktrace)
 include(hnswlib)
 include(bdb)
 include(rapidjson)
+include(dingo-libexpr)
 
 message(STATUS "protoc: ${PROTOBUF_PROTOC_EXECUTABLE}, proto inc: ${PROTOBUF_INCLUDE_DIRS}, lib: ${PROTOBUF_LIBRARIES}, ${PROTOBUF_PROTOC_LIBRARY}, protos: ${PROTO_FILES}")
 SET(MESSAGE_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto)
@@ -197,6 +198,8 @@ include_directories(${LIBUNWIND_INCLUDE_DIR})
 include_directories(${LIBBACKTRACE_INCLUDE_DIR})
 include_directories(${BDB_INCLUDE_DIR})
 include_directories(${RAPIDJSON_INCLUDE_DIR})
+include_directories(${DINGO_LIBEXPR_INCLUDE_DIR})
+include_directories(${DINGO_LIBEXPR_INCLUDE_DIR}/dingo-libexpr)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 set(DYNAMIC_LIB
@@ -223,6 +226,8 @@ set(DYNAMIC_LIB
     ${LIBBACKTRACE_LIBRARIES}
     ${OPENMP_LIBRARY}
     ${BDB_LIBRARIES}
+    ${DINGO_LIBEXPR_REL_LIBRARIES}
+    ${DINGO_LIBEXPR_LIBRARIES}
     # rt
     dl
     Threads::Threads
@@ -248,6 +253,7 @@ set(DEPEND_LIBS
     libunwind
     libbacktrace
     bdb
+    dingolibexpr
     )
 
 if(LINK_TCMALLOC)
