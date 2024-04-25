@@ -768,6 +768,8 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+
+
   SetDefaultConfAndCoorList(role);
 
   if (FLAGS_conf.empty()) {
@@ -794,6 +796,66 @@ int main(int argc, char *argv[]) {
     DINGO_LOG(ERROR) << "InitLog failed!";
     return -1;
   }
+
+  #if defined(__F16C__)
+    DINGO_LOG(INFO) << "define __F16C__";
+#else
+    DINGO_LOG(INFO) << "not defined __F16C__" ;
+#endif
+
+#if defined(__FMA__)
+    DINGO_LOG(INFO) << "define __FMA__" ;
+#else
+    DINGO_LOG(INFO) << "not defined __FMA__" ;
+#endif
+
+#if defined(__SSE__)
+    DINGO_LOG(INFO) << "define __SSE__" ;
+#else
+    DINGO_LOG(INFO) << "not defined __SSE__" ;
+#endif
+
+#if defined(__SSE2__)
+    DINGO_LOG(INFO) << "define __SSE2__"  ;
+#else
+    DINGO_LOG(INFO) << "not defined __SSE2__" ;
+#endif
+
+#if defined(__SSE3__)
+    DINGO_LOG(INFO) << "define __SSE3__ " << std::endl;
+#else
+    DINGO_LOG(INFO) << "not defined __SSE3__" ;
+#endif
+
+#if defined(__SSE4_1__)
+    DINGO_LOG(INFO) << "define __SSE4_1__ " ;
+#else
+    DINGO_LOG(INFO) << "not defined __SSE4_1__" ;
+#endif
+
+#if defined(__SSE4_2__)
+    DINGO_LOG(INFO) << "define __SSE4_2__ " << std::endl;
+#else
+    DINGO_LOG(INFO) << "not defined __SSE4_2__" ;
+#endif
+
+#if defined(__AVX__)
+    DINGO_LOG(INFO) << "define __AVX__ " << std::endl;
+#else
+    DINGO_LOG(INFO) << "not defined __AVX__";
+#endif
+
+#if defined(__AVX2__)
+    DINGO_LOG(INFO) << "define __AVX2__" ;
+#else
+    DINGO_LOG(INFO) << "not defined __AVX2__" ;
+#endif
+
+#if defined(__AVX512F__)
+    DINGO_LOG(INFO) << "define __AVX512F__ " << std::endl;
+#else
+    DINGO_LOG(INFO) << "not defined __AVX512F__" ;
+#endif
 
   if (!dingo_server.InitServerID()) {
     DINGO_LOG(ERROR) << "InitServerID failed!";

@@ -34,9 +34,9 @@ void InitLog(const std::string& log_dir) {
   FLAGS_stop_logging_if_full_disk = true;
   FLAGS_minloglevel = google::GLOG_INFO;
   FLAGS_logbuflevel = google::GLOG_INFO;
-  FLAGS_logtostdout = false;
-  FLAGS_logtostderr = false;
-  FLAGS_alsologtostderr = false;
+  FLAGS_logtostdout = true;
+  FLAGS_logtostderr = true;
+  FLAGS_alsologtostderr = true;
 
   std::string program_name = "dingodb_unit_test";
 
