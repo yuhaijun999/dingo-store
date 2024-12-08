@@ -720,6 +720,7 @@ add_executable(
   src/mvcc/codec.cc
   src/vector/codec.cc
   src/document/codec.cc
+  src/common/synchronization.cc
   ${SERIAL_SRCS}
   ${VERSION_SRCS}
   $<TARGET_OBJECTS:PROTO_OBJS>)
@@ -755,6 +756,8 @@ target_link_libraries(dingodb_client ${DYNAMIC_LIB})
 target_link_libraries(dingodb_cli ${DYNAMIC_LIB} CLI11::CLI11)
 
 target_link_libraries(dingodb_br ${DYNAMIC_LIB})
+
+target_include_directories(dingodb_br PUBLIC BRPC_INCLUDE_DIR)
 
 if(BUILD_UNIT_TESTS)
   message(STATUS "Build unit test")

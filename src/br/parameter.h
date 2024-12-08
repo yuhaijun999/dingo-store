@@ -1,0 +1,48 @@
+// Copyright (c) 2023 dingodb.com, Inc. All Rights Reserved
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef DINGODB_BR_PARAMETER_H_
+#define DINGODB_BR_PARAMETER_H_
+
+#include "gflags/gflags.h"
+
+namespace br {
+
+DECLARE_string(coor_url);
+
+DECLARE_string(br_type);
+
+DECLARE_string(br_backup_type);
+
+DECLARE_string(backupts);
+DECLARE_int64(backuptso_internal);
+
+DECLARE_string(storage);
+DECLARE_string(storage_internal);
+
+struct BackupParams {
+  std::string coor_url;
+  std::string br_type;
+  std::string br_backup_type;
+  std::string backupts;
+  int64_t backuptso_internal;
+  std::string storage;
+  std::string storage_internal;
+};
+
+inline const std::string kBackupFileLock = "backup.lock";
+
+}  // namespace br
+
+#endif  // DINGODB_BR_PARAMETER_H_

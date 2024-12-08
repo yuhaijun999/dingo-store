@@ -34,3 +34,5 @@ set(UNIT_TEST_LIBS ${UNIT_TEST_LIBS} ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} "-Xli
                    "-Xlinker \"-)\"")
 
 target_link_libraries(${UNIT_TEST_BIN} ${UNIT_TEST_LIBS})
+
+target_include_directories(${UNIT_TEST_BIN} PUBLIC BRPC_INCLUDE_DIR)
