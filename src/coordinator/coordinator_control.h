@@ -312,7 +312,7 @@ class CoordinatorControl : public MetaControl {
   butil::Status ChangePeerRegionWithTaskList(int64_t region_id, std::vector<int64_t> &new_store_ids,
                                              pb::coordinator_internal::MetaIncrement &meta_increment);
   butil::Status ChangePairPeerRegionWithTaskList(int64_t region_id, std::vector<int64_t> &new_store_ids,
-                                                         pb::coordinator_internal::MetaIncrement &meta_increment);
+                                                 pb::coordinator_internal::MetaIncrement &meta_increment);
 
   // transfer leader region
   butil::Status TransferLeaderRegionWithTaskList(int64_t region_id, int64_t new_leader_store_id, bool is_force,
@@ -939,6 +939,12 @@ class CoordinatorControl : public MetaControl {
   butil::Status GetTenants(std::vector<int64_t> tenant_ids, std::vector<pb::meta::Tenant> &tenants);
   butil::Status GetAllTenants(std::vector<pb::meta::Tenant> &tenants);
 
+  // backup & restore
+  static butil::Status RegisterBackup(const std::string &backup_name, const std::string &backup_path,
+                                      int64_t backup_start_timestamp, int64_t backup_current_timestamp,
+                                      int64_t backup_timeout_s);
+  static butil::Status UnRegisterBackup(const std::string &backup_name);
+
  private:
   butil::Status ValidateTaskListConflict(int64_t region_id, int64_t second_region_id);
 
@@ -1138,6 +1144,42 @@ class MetaWatchCleanTask : public TaskRunnable {
  private:
   CoordinatorControl *coordinator_control_;
   int64_t max_outdate_time_ms_;
+};
+
+// backup & restore
+
+struct BrBackupWatchDogInfo {
+  std::string backup_name;
+  std::string backup_path;
+  int64_t backup_start_timestamp;
+  int64_t backup_current_timestamp;
+  int64_t backup_timeout_s;
+
+  BrBackupWatchDogInfo(const std::string &backup_name, const std::string &backup_path, int64_t backup_start_timestamp,
+                       int64_t backup_current_timestamp, int64_t backup_timeout_s)
+      : backup_name(backup_name),
+        backup_path(backup_path),
+        backup_start_timestamp(backup_start_timestamp),
+        backup_current_timestamp(backup_current_timestamp),
+        backup_timeout_s(backup_timeout_s) {}
+
+  ~BrBackupWatchDogInfo() = default;
+};
+class BrWatchDogManager {
+ public:
+  static BrWatchDogManager *Instance();
+
+  butil::Status RegisterBackup(const std::string &backup_name, const std::string &backup_path,
+                               int64_t backup_start_timestamp, int64_t backup_current_timestamp,
+                               int64_t backup_timeout_s);
+
+  butil::Status UnRegisterBackup(const std::string &backup_name);
+
+ private:
+  BrWatchDogManager();
+  ~BrWatchDogManager();
+  std::shared_ptr<BrBackupWatchDogInfo> br_backup_watch_dog_info_;
+  bthread_mutex_t mutex_;
 };
 
 }  // namespace dingodb

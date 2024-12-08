@@ -70,11 +70,14 @@ class ServerInteraction {
 
   int64_t GetLatency() const { return latency_; }
 
+  std::vector<std::string> GetAddrs();
+
  private:
   std::atomic<int> leader_index_;
   std::vector<butil::EndPoint> endpoints_;
   std::vector<std::unique_ptr<brpc::Channel> > channels_;
   int64_t latency_;
+  std::vector<std::string> addrs_;
 };
 
 using ServerInteractionPtr = std::shared_ptr<ServerInteraction>;

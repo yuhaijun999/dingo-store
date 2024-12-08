@@ -19,9 +19,9 @@
 
 namespace br {
 
-InteractionManager::InteractionManager() { bthread_mutex_init(&mutex_, nullptr); }
+InteractionManager::InteractionManager() = default;
 
-InteractionManager::~InteractionManager() { bthread_mutex_destroy(&mutex_); }
+InteractionManager::~InteractionManager() = default;
 
 InteractionManager& InteractionManager::GetInstance() {
   static InteractionManager instance;
@@ -29,20 +29,56 @@ InteractionManager& InteractionManager::GetInstance() {
 }
 
 void InteractionManager::SetCoordinatorInteraction(ServerInteractionPtr interaction) {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
   coordinator_interaction_ = interaction;
 }
 
-void InteractionManager::SetStoreInteraction(ServerInteractionPtr interaction) { store_interaction_ = interaction; }
+void InteractionManager::SetStoreInteraction(ServerInteractionPtr interaction) {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  store_interaction_ = interaction;
+}
 
-void InteractionManager::SetIndexInteraction(ServerInteractionPtr interaction) { index_interaction_ = interaction; }
+void InteractionManager::SetIndexInteraction(ServerInteractionPtr interaction) {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  index_interaction_ = interaction;
+}
 void InteractionManager::SetDocumentInteraction(ServerInteractionPtr interaction) {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
   document_interaction_ = interaction;
 }
 
-ServerInteractionPtr InteractionManager::GetCoordinatorInteraction() const { return coordinator_interaction_; }
-ServerInteractionPtr InteractionManager::GetStoreInteraction() const { return store_interaction_; }
-ServerInteractionPtr InteractionManager::GetIndexInteraction() const { return index_interaction_; }
-ServerInteractionPtr InteractionManager::GetDocumentInteraction() const { return document_interaction_; }
+ServerInteractionPtr InteractionManager::GetCoordinatorInteraction() {
+  ServerInteractionPtr interaction;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    interaction = coordinator_interaction_;
+  }
+  return interaction;
+}
+ServerInteractionPtr InteractionManager::GetStoreInteraction() {
+  ServerInteractionPtr interaction;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    interaction = store_interaction_;
+  }
+  return interaction;
+}
+ServerInteractionPtr InteractionManager::GetIndexInteraction() {
+  ServerInteractionPtr interaction;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    interaction = index_interaction_;
+  }
+  return interaction;
+}
+ServerInteractionPtr InteractionManager::GetDocumentInteraction() {
+  ServerInteractionPtr interaction;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    interaction = document_interaction_;
+  }
+  return interaction;
+}
 
 bool InteractionManager::CreateStoreInteraction(std::vector<std::string> addrs) {
   auto interaction = std::make_shared<ServerInteraction>();
@@ -52,7 +88,7 @@ bool InteractionManager::CreateStoreInteraction(std::vector<std::string> addrs) 
   }
 
   {
-    BAIDU_SCOPED_LOCK(mutex_);
+    dingodb::RWLockWriteGuard guard(&rw_lock_);
     if (store_interaction_ == nullptr) {
       store_interaction_ = interaction;
     }
@@ -93,7 +129,7 @@ bool InteractionManager::CreateIndexInteraction(std::vector<std::string> addrs) 
   }
 
   {
-    BAIDU_SCOPED_LOCK(mutex_);
+    dingodb::RWLockWriteGuard guard(&rw_lock_);
     if (index_interaction_ == nullptr) {
       index_interaction_ = interaction;
     }
@@ -133,7 +169,7 @@ bool InteractionManager::CreateDocumentInteraction(std::vector<std::string> addr
   }
 
   {
-    BAIDU_SCOPED_LOCK(mutex_);
+    dingodb::RWLockWriteGuard guard(&rw_lock_);
     if (document_interaction_ == nullptr) {
       document_interaction_ = interaction;
     }
@@ -166,36 +202,73 @@ butil::Status InteractionManager::CreateDocumentInteraction(int64_t region_id) {
   return butil::Status();
 }
 
-int64_t InteractionManager::GetCoordinatorInteractionLatency() const {
-  if (coordinator_interaction_ == nullptr) {
-    return 0;
-  }
-
-  return coordinator_interaction_->GetLatency();
+void InteractionManager::ResetCoordinatorInteraction() {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  coordinator_interaction_.reset();
+}
+void InteractionManager::ResetStoreInteraction() {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  store_interaction_.reset();
+}
+void InteractionManager::ResetIndexInteraction() {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  index_interaction_.reset();
+}
+void InteractionManager::ResetDocumentInteraction() {
+  dingodb::RWLockWriteGuard guard(&rw_lock_);
+  document_interaction_.reset();
 }
 
-int64_t InteractionManager::GetStoreInteractionLatency() const {
-  if (store_interaction_ == nullptr) {
-    return 0;
-  }
+int64_t InteractionManager::GetCoordinatorInteractionLatency() {
+  int64_t latency = 0;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (coordinator_interaction_ == nullptr) {
+      return 0;
+    }
 
-  return store_interaction_->GetLatency();
+    latency = coordinator_interaction_->GetLatency();
+  }
+  return latency;
 }
 
-int64_t InteractionManager::GetIndexInteractionLatency() const {
-  if (index_interaction_ == nullptr) {
-    return 0;
-  }
+int64_t InteractionManager::GetStoreInteractionLatency() {
+  int64_t latency = 0;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (store_interaction_ == nullptr) {
+      return 0;
+    }
 
-  return index_interaction_->GetLatency();
+    latency = store_interaction_->GetLatency();
+  }
+  return latency;
 }
 
-int64_t InteractionManager::GetDocumentInteractionLatency() const {
-  if (document_interaction_ == nullptr) {
-    return 0;
-  }
+int64_t InteractionManager::GetIndexInteractionLatency() {
+  int64_t latency = 0;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (index_interaction_ == nullptr) {
+      return 0;
+    }
 
-  return document_interaction_->GetLatency();
+    latency = index_interaction_->GetLatency();
+  }
+  return latency;
+}
+
+int64_t InteractionManager::GetDocumentInteractionLatency() {
+  int64_t latency = 0;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (document_interaction_ == nullptr) {
+      return 0;
+    }
+
+    latency = document_interaction_->GetLatency();
+  }
+  return latency;
 }
 
 }  // namespace br
