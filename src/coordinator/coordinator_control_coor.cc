@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +35,7 @@
 #include "config/config_helper.h"
 #include "coordinator/coordinator_control.h"
 #include "fmt/core.h"
+#include "fmt/format.h"
 #include "gflags/gflags.h"
 #include "metrics/coordinator_bvar_metrics.h"
 #include "proto/common.pb.h"
@@ -982,7 +984,7 @@ void CoordinatorControl::GetRegionMap(pb::common::RegionMap& region_map, int64_t
     region_map_.GetRawMapCopy(region_internal_map_copy);
 
     for (auto& element : region_internal_map_copy) {
-      if (tenant_id == element.second.definition().tenant_id()) {
+      if (tenant_id == element.second.definition().tenant_id() || tenant_id == -1) {
         auto* tmp_region = region_map.add_regions();
         GenRegionSlim(element.second, *tmp_region);
       }
@@ -4705,9 +4707,9 @@ void CoordinatorControl::UpdateRegionMapAndStoreOperation(const pb::common::Stor
         region_to_update.definition().range().end_key() != region_metrics.region_definition().range().end_key()) {
       DINGO_LOG(INFO) << "region range change region_id = " << region_metrics.id() << " old range = ["
                       << Helper::StringToHex(region_to_update.definition().range().start_key()) << ", "
-                      << Helper::StringToHex(region_to_update.definition().range().end_key()) << ")" << " new range = ["
-                      << Helper::StringToHex(region_metrics.region_definition().range().start_key()) << ", "
-                      << Helper::StringToHex(region_metrics.region_definition().range().end_key()) << ")";
+                      << Helper::StringToHex(region_to_update.definition().range().end_key()) << ")"
+                      << " new range = [" << Helper::StringToHex(region_metrics.region_definition().range().start_key())
+                      << ", " << Helper::StringToHex(region_metrics.region_definition().range().end_key()) << ")";
       if (!leader_has_old_epoch) {
         need_update_region_metrics = true;
       }
@@ -5612,8 +5614,8 @@ bool CoordinatorControl::DoTaskPreCheck(const pb::coordinator::TaskPreCheck& tas
         for (auto i : peers_of_region) {
           region_str += std::to_string(i) + " ";
         }
-        DINGO_LOG(INFO) << "peers of region and peers to check not equal" << " check ids : " << check_str
-                        << " region ids : " << region_str;
+        DINGO_LOG(INFO) << "peers of region and peers to check not equal"
+                        << " check ids : " << check_str << " region ids : " << region_str;
         check_passed = false;
       }
     }
@@ -6885,6 +6887,82 @@ butil::Status CoordinatorControl::CreateIds(pb::coordinator::IdEpochType id_epoc
                   << ", from: " << ids.front() << " to: " << ids.back();
 
   return butil::Status::OK();
+}
+
+// backup & restore
+
+BrWatchDogManager::BrWatchDogManager() { bthread_mutex_init(&mutex_, nullptr); }
+BrWatchDogManager::~BrWatchDogManager() { bthread_mutex_destroy(&mutex_); }
+
+BrWatchDogManager* BrWatchDogManager::Instance() {
+  static BrWatchDogManager instance;
+  return &instance;
+}
+
+butil::Status BrWatchDogManager::RegisterBackup(const std::string& backup_name, const std::string& backup_path,
+                                                int64_t backup_start_timestamp, int64_t backup_current_timestamp,
+                                                int64_t backup_timeout_s) {
+  BAIDU_SCOPED_LOCK(mutex_);
+  // check exist
+  if (!br_backup_watch_dog_info_) {
+    br_backup_watch_dog_info_ = std::make_shared<BrBackupWatchDogInfo>(backup_name, backup_path, backup_start_timestamp,
+                                                                       backup_current_timestamp, backup_timeout_s);
+  } else {
+    // get current timestamp
+    int64_t current_timestamp = Helper::Timestamp();
+    // update
+    if (br_backup_watch_dog_info_->backup_name == backup_name) {
+      br_backup_watch_dog_info_->backup_current_timestamp = backup_current_timestamp;
+    } else {  // backup name not match
+      if (current_timestamp >
+          (br_backup_watch_dog_info_->backup_current_timestamp + br_backup_watch_dog_info_->backup_timeout_s)) {
+        // timeout, reset
+        br_backup_watch_dog_info_ = std::make_shared<BrBackupWatchDogInfo>(
+            backup_name, backup_path, backup_start_timestamp, backup_current_timestamp, backup_timeout_s);
+      } else {
+        // not timeout, update backup_current_timestamp
+        std::string s = fmt::format(
+            "register backup  failed, backup exist. backup name not match, input backup_name={} not match current "
+            "already exist backup_name={}",
+            backup_name, br_backup_watch_dog_info_->backup_name);
+        DINGO_LOG(ERROR) << s;
+        return butil::Status(pb::error::EBACKUP_TASK_EXIST, s);
+      }
+    }
+  }
+  return butil::Status::OK();
+}
+
+butil::Status BrWatchDogManager::UnRegisterBackup(const std::string& backup_name) {
+  BAIDU_SCOPED_LOCK(mutex_);
+  // check exist
+  if (!br_backup_watch_dog_info_) {
+    return butil::Status::OK();
+  } else {
+    // backup name equal
+    if (br_backup_watch_dog_info_->backup_name == backup_name) {
+      br_backup_watch_dog_info_.reset();
+    } else {  // backup name not match
+      std::string s = fmt::format(
+          "unregister backup failed. backup name not match, input backup_name={} not match current already exist "
+          "backup_name={}",
+          backup_name, br_backup_watch_dog_info_->backup_name);
+      DINGO_LOG(ERROR) << s;
+      return butil::Status(pb::error::EBACKUP_TASK_NAME_NOT_MATCH, s);
+    }
+  }
+  return butil::Status::OK();
+}
+
+butil::Status CoordinatorControl::RegisterBackup(const std::string& backup_name, const std::string& backup_path,
+                                                 int64_t backup_start_timestamp, int64_t backup_current_timestamp,
+                                                 int64_t backup_timeout_s) {
+  return BrWatchDogManager::Instance()->RegisterBackup(backup_name, backup_path, backup_start_timestamp,
+                                                       backup_current_timestamp, backup_timeout_s);
+}
+
+butil::Status CoordinatorControl::UnRegisterBackup(const std::string& backup_name) {
+  return BrWatchDogManager::Instance()->UnRegisterBackup(backup_name);
 }
 
 }  // namespace dingodb

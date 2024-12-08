@@ -214,6 +214,12 @@ class MetaServiceImpl : public pb::meta::MetaService {
   void ListWatch(google::protobuf::RpcController* controller, const pb::meta::ListWatchRequest* request,
                  pb::meta::ListWatchResponse* response, google::protobuf::Closure* done) override;
 
+  void ExportMeta(google::protobuf::RpcController* controller, const pb::meta::ExportMetaRequest* request,
+                  pb::meta::ExportMetaResponse* response, google::protobuf::Closure* done) override;
+
+  void SaveIdEpochType(google::protobuf::RpcController* controller, const pb::meta::SaveIdEpochTypeRequest* request,
+                       pb::meta::SaveIdEpochTypeResponse* response, google::protobuf::Closure* done) override;
+
   void SetWorkSet(WorkerSetPtr worker_set) { worker_set_ = worker_set; }
 
   // table and index definition convertor

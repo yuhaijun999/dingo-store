@@ -17,6 +17,7 @@
 
 #include "br/interation.h"
 #include "br/router.h"
+#include "common/synchronization.h"
 
 namespace br {
 class InteractionManager {
@@ -28,45 +29,58 @@ class InteractionManager {
   void SetIndexInteraction(ServerInteractionPtr interaction);
   void SetDocumentInteraction(ServerInteractionPtr interaction);
 
-  ServerInteractionPtr GetCoordinatorInteraction() const;
-  ServerInteractionPtr GetStoreInteraction() const;
-  ServerInteractionPtr GetIndexInteraction() const;
-  ServerInteractionPtr GetDocumentInteraction() const;
+  ServerInteractionPtr GetCoordinatorInteraction();
+  ServerInteractionPtr GetStoreInteraction();
+  ServerInteractionPtr GetIndexInteraction();
+  ServerInteractionPtr GetDocumentInteraction();
 
   bool CreateStoreInteraction(std::vector<std::string> addrs);
-  butil::Status CreateStoreInteraction(int64_t region_id);
+  [[deprecated(
+      "CreateStoreInteraction with region_id is deprecated. Use CreateStoreInteraction addrs instead.")]] butil::Status
+  CreateStoreInteraction(int64_t region_id);
 
   bool CreateIndexInteraction(std::vector<std::string> addrs);
-  butil::Status CreateIndexInteraction(int64_t region_id);
+  [[deprecated(
+      "CreateIndexInteraction with region_id is deprecated. Use CreateIndexInteraction addrs instead.")]] butil::Status
+  CreateIndexInteraction(int64_t region_id);
 
   bool CreateDocumentInteraction(std::vector<std::string> addrs);
-  butil::Status CreateDocumentInteraction(int64_t region_id);
+  [[deprecated(
+      "CreateDocumentInteraction with region_id is deprecated. Use CreateDocumentInteraction addrs instead.")]] butil::
+      Status
+      CreateDocumentInteraction(int64_t region_id);
 
-  void ResetCoordinatorInteraction() { coordinator_interaction_.reset(); }
-  void ResetStoreInteraction() { store_interaction_.reset(); }
-  void ResetIndexInteraction() { index_interaction_.reset(); }
-  void ResetDocumentInteraction() { document_interaction_.reset(); }
+  void ResetCoordinatorInteraction();
+  void ResetStoreInteraction();
+  void ResetIndexInteraction();
+  void ResetDocumentInteraction();
 
-  int64_t GetCoordinatorInteractionLatency() const;
-  int64_t GetStoreInteractionLatency() const;
-  int64_t GetIndexInteractionLatency() const;
-  int64_t GetDocumentInteractionLatency() const;
+  int64_t GetCoordinatorInteractionLatency();
+  int64_t GetStoreInteractionLatency();
+  int64_t GetIndexInteractionLatency();
+  int64_t GetDocumentInteractionLatency();
 
   template <typename Request, typename Response>
   butil::Status SendRequestWithoutContext(const std::string& service_name, const std::string& api_name,
                                           const Request& request, Response& response);
 
   template <typename Request, typename Response>
-  butil::Status SendRequestWithContext(const std::string& service_name, const std::string& api_name, Request& request,
-                                       Response& response);
+  [[deprecated(
+      "SendRequestWithContext is deprecated. Use SendRequestWithoutContext instead. "
+      "instead.")]] butil::Status
+  SendRequestWithContext(const std::string& service_name, const std::string& api_name, Request& request,
+                         Response& response);
 
   template <typename Request, typename Response>
   butil::Status AllSendRequestWithoutContext(const std::string& service_name, const std::string& api_name,
                                              const Request& request, Response& response);
 
   template <typename Request, typename Response>
-  butil::Status AllSendRequestWithContext(const std::string& service_name, const std::string& api_name,
-                                          const Request& request, Response& response);
+  [[deprecated(
+      "AllSendRequestWithContext is deprecated. Use AllSendRequestWithoutContext instead. "
+      "instead.")]] butil::Status
+  AllSendRequestWithContext(const std::string& service_name, const std::string& api_name, const Request& request,
+                            Response& response);
 
  private:
   InteractionManager();
@@ -77,55 +91,93 @@ class InteractionManager {
   ServerInteractionPtr index_interaction_;
   ServerInteractionPtr document_interaction_;
 
-  bthread_mutex_t mutex_;
+  dingodb::RWLock rw_lock_;
 };
 
 template <typename Request, typename Response>
 butil::Status InteractionManager::SendRequestWithoutContext(const std::string& service_name,
                                                             const std::string& api_name, const Request& request,
                                                             Response& response) {
-  if (service_name == "UtilService" || service_name == "DebugService") {
-    if (store_interaction_ == nullptr) {
-      DINGO_LOG(ERROR) << "Store interaction is nullptr.";
-      return butil::Status(dingodb::pb::error::EINTERNAL, "Store interaction is nullptr.");
-    }
+  dingodb::RWLockReadGuard guard(&rw_lock_);
+  if (service_name == "CoordinatorService" || service_name == "MetaService") {
+    return coordinator_interaction_->SendRequest(service_name, api_name, request, response);
+  } else if (service_name == "StoreService") {
     return store_interaction_->SendRequest(service_name, api_name, request, response);
+  } else if (service_name == "IndexService") {
+    return index_interaction_->SendRequest(service_name, api_name, request, response);
+  } else if (service_name == "DocumentService") {
+    return document_interaction_->SendRequest(service_name, api_name, request, response);
+  } else {
+    DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
   }
-  return coordinator_interaction_->SendRequest(service_name, api_name, request, response);
 
-  
-
-
-
+  return butil::Status();
 }
 
 template <typename Request, typename Response>
 butil::Status InteractionManager::SendRequestWithContext(const std::string& service_name, const std::string& api_name,
                                                          Request& request, Response& response) {
-  if (store_interaction_ == nullptr) {
-    auto status = CreateStoreInteraction(request.context().region_id());
+  ServerInteractionPtr interaction;
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (service_name == "StoreService") {
+      interaction = store_interaction_;
+    } else if (service_name == "IndexService") {
+      interaction = index_interaction_;
+    } else if (service_name == "DocumentService") {
+      interaction = document_interaction_;
+    } else {
+      DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
+    }
+  }
+
+  if (interaction == nullptr) {
+    butil::Status status;
+    if (service_name == "StoreService") {
+      status = CreateStoreInteraction(request.context().region_id());
+    } else if (service_name == "IndexService") {
+      status = CreateIndexInteraction(request.context().region_id());
+    } else if (service_name == "DocumentService") {
+      status = CreateDocumentInteraction(request.context().region_id());
+    }
     if (!status.ok()) {
       return status;
     }
   }
 
-  for (;;) {
-    auto status = store_interaction_->SendRequest(service_name, api_name, request, response);
-    if (status.ok()) {
-      return status;
-    }
-
-    if (response.error().errcode() == dingodb::pb::error::EREGION_VERSION) {
-      RegionRouter::GetInstance().UpdateRegionEntry(response.error().store_region_info());
-      DINGO_LOG(INFO) << "QueryRegionEntry region_id: " << request.context().region_id();
-      auto region_entry = RegionRouter::GetInstance().QueryRegionEntry(request.context().region_id());
-      if (region_entry == nullptr) {
-        return butil::Status(dingodb::pb::error::EREGION_NOT_FOUND, "Not found region %lu",
-                             request.context().region_id());
-      }
-      *request.mutable_context() = region_entry->GenConext();
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (service_name == "StoreService") {
+      interaction = store_interaction_;
+    } else if (service_name == "IndexService") {
+      interaction = index_interaction_;
+    } else if (service_name == "DocumentService") {
+      interaction = document_interaction_;
     } else {
-      return status;
+      DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
+    }
+  }
+
+  for (;;) {
+    {
+      dingodb::RWLockReadGuard guard(&rw_lock_);
+      auto status = interaction->SendRequest(service_name, api_name, request, response);
+      if (status.ok()) {
+        return status;
+      }
+
+      if (response.error().errcode() == dingodb::pb::error::EREGION_VERSION) {
+        RegionRouter::GetInstance().UpdateRegionEntry(response.error().store_region_info());
+        DINGO_LOG(INFO) << "QueryRegionEntry region_id: " << request.context().region_id();
+        auto region_entry = RegionRouter::GetInstance().QueryRegionEntry(request.context().region_id());
+        if (region_entry == nullptr) {
+          return butil::Status(dingodb::pb::error::EREGION_NOT_FOUND, "Not found region %lu",
+                               request.context().region_id());
+        }
+        *request.mutable_context() = region_entry->GenConext();
+      } else {
+        return status;
+      }
     }
     bthread_usleep(1000 * 500);
   }
@@ -135,40 +187,84 @@ template <typename Request, typename Response>
 butil::Status InteractionManager::AllSendRequestWithoutContext(const std::string& service_name,
                                                                const std::string& api_name, const Request& request,
                                                                Response& response) {
-  if (store_interaction_ == nullptr) {
-    return butil::Status(dingodb::pb::error::EINTERNAL, "Store interaction is nullptr.");
+  dingodb::RWLockReadGuard guard(&rw_lock_);
+  if (service_name == "CoordinatorService" || service_name == "MetaService") {
+    return coordinator_interaction_->AllSendRequest(service_name, api_name, request, response);
+  } else if (service_name == "StoreService") {
+    return store_interaction_->AllSendRequest(service_name, api_name, request, response);
+  } else if (service_name == "IndexService") {
+    return index_interaction_->AllSendRequest(service_name, api_name, request, response);
+  } else if (service_name == "DocumentService") {
+    return document_interaction_->AllSendRequest(service_name, api_name, request, response);
+  } else {
+    DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
   }
 
-  return store_interaction_->AllSendRequest(service_name, api_name, request, response);
+  return butil::Status();
 }
 
 template <typename Request, typename Response>
 butil::Status InteractionManager::AllSendRequestWithContext(const std::string& service_name,
                                                             const std::string& api_name, const Request& request,
                                                             Response& response) {
-  if (store_interaction_ == nullptr) {
-    auto status = CreateStoreInteraction(request.context().region_id());
+  ServerInteractionPtr interaction;
+  dingodb::RWLockReadGuard guard(&rw_lock_);
+  if (service_name == "StoreService") {
+    interaction = store_interaction_;
+  } else if (service_name == "IndexService") {
+    interaction = index_interaction_;
+  } else if (service_name == "DocumentService") {
+    interaction = document_interaction_;
+  } else {
+    DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
+  }
+
+  if (interaction == nullptr) {
+    butil::Status status;
+    if (service_name == "StoreService") {
+      status = CreateStoreInteraction(request.context().region_id());
+    } else if (service_name == "IndexService") {
+      status = CreateIndexInteraction(request.context().region_id());
+    } else if (service_name == "DocumentService") {
+      status = CreateDocumentInteraction(request.context().region_id());
+    }
     if (!status.ok()) {
       return status;
     }
   }
 
-  for (;;) {
-    auto status = store_interaction_->AllSendRequest(service_name, api_name, request, response);
-    if (status.ok()) {
-      return status;
-    }
-
-    if (response.error().errcode() == dingodb::pb::error::EREGION_VERSION) {
-      RegionRouter::GetInstance().UpdateRegionEntry(response.error().store_region_info());
-      auto region_entry = RegionRouter::GetInstance().QueryRegionEntry(request.context().region_id());
-      if (region_entry == nullptr) {
-        return butil::Status(dingodb::pb::error::EREGION_NOT_FOUND, "Not found region %lu",
-                             request.context().region_id());
-      }
-      *request.mutable_context() = region_entry->GenConext();
+  {
+    dingodb::RWLockReadGuard guard(&rw_lock_);
+    if (service_name == "StoreService") {
+      interaction = store_interaction_;
+    } else if (service_name == "IndexService") {
+      interaction = index_interaction_;
+    } else if (service_name == "DocumentService") {
+      interaction = document_interaction_;
     } else {
-      return status;
+      DINGO_LOG(FATAL) << "Unknown service name: " << service_name;
+    }
+  }
+
+  for (;;) {
+    {
+      dingodb::RWLockReadGuard guard(&rw_lock_);
+      auto status = interaction->AllSendRequest(service_name, api_name, request, response);
+      if (status.ok()) {
+        return status;
+      }
+
+      if (response.error().errcode() == dingodb::pb::error::EREGION_VERSION) {
+        RegionRouter::GetInstance().UpdateRegionEntry(response.error().store_region_info());
+        auto region_entry = RegionRouter::GetInstance().QueryRegionEntry(request.context().region_id());
+        if (region_entry == nullptr) {
+          return butil::Status(dingodb::pb::error::EREGION_NOT_FOUND, "Not found region %lu",
+                               request.context().region_id());
+        }
+        *request.mutable_context() = region_entry->GenConext();
+      } else {
+        return status;
+      }
     }
     bthread_usleep(1000 * 500);
   }

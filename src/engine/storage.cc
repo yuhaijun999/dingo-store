@@ -1594,4 +1594,26 @@ butil::Status Storage::CommitMerge(std::shared_ptr<Context> ctx, int64_t job_id,
   }
 }
 
+butil::Status Storage::BackupData(std::shared_ptr<Context> ctx, store::RegionPtr region,
+                                  const pb::common::RegionType& region_type, std::string backup_ts, int64_t backup_tso,
+                                  const std::string& storage_path, const pb::common::StorageBackend& storage_backend,
+                                  const pb::common::CompressionType& compression_type, int32_t compression_level,
+                                  dingodb::pb::store::BackupDataResponse* response) {
+  RawEnginePtr raw_engine = GetRawEngine(ctx->StoreEngineType(), ctx->RawEngineType());
+
+  return TxnEngineHelper::BackupData(ctx, raw_engine, region, region_type, backup_ts, backup_tso, storage_path,
+                                     storage_backend, compression_type, compression_level, response);
+}
+
+butil::Status Storage::BackupMeta(std::shared_ptr<Context> ctx, store::RegionPtr region,
+                                  const pb::common::RegionType& region_type, std::string backup_ts, int64_t backup_tso,
+                                  const std::string& storage_path, const pb::common::StorageBackend& storage_backend,
+                                  const pb::common::CompressionType& compression_type, int32_t compression_level,
+                                  dingodb::pb::store::BackupMetaResponse* response) {
+  RawEnginePtr raw_engine = GetRawEngine(ctx->StoreEngineType(), ctx->RawEngineType());
+
+  return TxnEngineHelper::BackupMeta(ctx, raw_engine, region, region_type, backup_ts, backup_tso, storage_path,
+                                     storage_backend, compression_type, compression_level, response);
+}
+
 }  // namespace dingodb
