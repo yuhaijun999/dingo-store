@@ -51,6 +51,9 @@ class ServerInteraction {
   ServerInteraction(ServerInteraction&&) = delete;
   ServerInteraction& operator=(ServerInteraction&&) = delete;
 
+  static butil::Status CreateInteraction(const std::vector<std::string>& addrs,
+                                         std::shared_ptr<ServerInteraction>& interaction);
+
   bool Init(const std::string& addrs);
   bool Init(std::vector<std::string> addrs);
 
@@ -70,11 +73,14 @@ class ServerInteraction {
 
   int64_t GetLatency() const { return latency_; }
 
+  std::vector<std::string> GetAddrs();
+
  private:
   std::atomic<int> leader_index_;
   std::vector<butil::EndPoint> endpoints_;
   std::vector<std::unique_ptr<brpc::Channel> > channels_;
   int64_t latency_;
+  std::vector<std::string> addrs_;
 };
 
 using ServerInteractionPtr = std::shared_ptr<ServerInteraction>;
