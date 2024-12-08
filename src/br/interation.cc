@@ -48,6 +48,8 @@ bool ServerInteraction::Init(std::vector<std::string> addrs) {
     channels_.push_back(std::move(channel));
   }
 
+  addrs_ = addrs;
+
   return true;
 }
 
@@ -62,6 +64,7 @@ bool ServerInteraction::AddAddr(const std::string& addr) {
 
   channels_.push_back(std::move(channel));
   endpoints_.push_back(endpoint);
+  addrs_.push_back(addr);
 
   return true;
 }
@@ -97,5 +100,7 @@ void ServerInteraction::NextLeader(const dingodb::pb::common::Location& location
     leader_index_.store(endpoints_.size() - 1);
   }
 }
+
+std::vector<std::string> ServerInteraction::GetAddrs() { return addrs_; }
 
 }  // namespace br

@@ -3839,4 +3839,85 @@ void CoordinatorServiceImpl::CreateIds(google::protobuf::RpcController *controll
   }
 }
 
+// backup & restore
+void DoRegisterBackup(google::protobuf::RpcController * /*controller*/,
+                      const pb::coordinator::RegisterBackupRequest *request,
+                      pb::coordinator::RegisterBackupResponse *response, TrackClosure *done,
+                      std::shared_ptr<CoordinatorControl> coordinator_control,
+                      std::shared_ptr<Engine> /*raft_engine*/) {
+  brpc::ClosureGuard done_guard(done);
+
+  DINGO_LOG(DEBUG) << request->ShortDebugString();
+
+  auto ret = coordinator_control->RegisterBackup(request->backup_name(), request->backup_path(),
+                                                 request->backup_start_timestamp(), request->backup_current_timestamp(),
+                                                 request->backup_timeout_s());
+  if (!ret.ok()) {
+    DINGO_LOG(ERROR) << "RegisterBackup failed in coordinator_service";
+    response->mutable_error()->set_errcode(static_cast<pb::error::Errno>(ret.error_code()));
+    response->mutable_error()->set_errmsg(ret.error_str());
+    return;
+  }
+
+  DINGO_LOG(DEBUG) << "RegisterBackup Success. backup_name = " << request->backup_name();
+}
+void CoordinatorServiceImpl::RegisterBackup(google::protobuf::RpcController *controller,
+                                            const pb::coordinator::RegisterBackupRequest *request,
+                                            pb::coordinator::RegisterBackupResponse *response,
+                                            google::protobuf::Closure *done) {
+  brpc::ClosureGuard done_guard(done);
+
+  DINGO_LOG(DEBUG) << request->ShortDebugString();
+
+  // Run in queue.
+  auto *svr_done = new CoordinatorServiceClosure(__func__, done_guard.release(), request, response);
+  auto task = std::make_shared<ServiceTask>([this, controller, request, response, svr_done]() {
+    DoRegisterBackup(controller, request, response, svr_done, coordinator_control_, engine_);
+  });
+  bool ret = worker_set_->ExecuteRR(task);
+  if (!ret) {
+    brpc::ClosureGuard done_guard(svr_done);
+    ServiceHelper::SetError(response->mutable_error(), pb::error::EREQUEST_FULL, "Commit execute queue failed");
+  }
+}
+
+void DoUnRegisterBackup(google::protobuf::RpcController * /*controller*/,
+                        const pb::coordinator::UnRegisterBackupRequest *request,
+                        pb::coordinator::UnRegisterBackupResponse *response, TrackClosure *done,
+                        std::shared_ptr<CoordinatorControl> coordinator_control,
+                        std::shared_ptr<Engine> /*raft_engine*/) {
+  brpc::ClosureGuard done_guard(done);
+
+  DINGO_LOG(DEBUG) << request->ShortDebugString();
+
+  auto ret = coordinator_control->UnRegisterBackup(request->backup_name());
+  if (!ret.ok()) {
+    DINGO_LOG(ERROR) << "UnRegisterBackup failed in coordinator_service";
+    response->mutable_error()->set_errcode(static_cast<pb::error::Errno>(ret.error_code()));
+    response->mutable_error()->set_errmsg(ret.error_str());
+    return;
+  }
+
+  DINGO_LOG(INFO) << "UnRegisterBackup Success. backup_name = " << request->backup_name();
+}
+void CoordinatorServiceImpl::UnRegisterBackup(google::protobuf::RpcController *controller,
+                                              const pb::coordinator::UnRegisterBackupRequest *request,
+                                              pb::coordinator::UnRegisterBackupResponse *response,
+                                              google::protobuf::Closure *done) {
+  brpc::ClosureGuard done_guard(done);
+
+  DINGO_LOG(DEBUG) << request->ShortDebugString();
+
+  // Run in queue.
+  auto *svr_done = new CoordinatorServiceClosure(__func__, done_guard.release(), request, response);
+  auto task = std::make_shared<ServiceTask>([this, controller, request, response, svr_done]() {
+    DoUnRegisterBackup(controller, request, response, svr_done, coordinator_control_, engine_);
+  });
+  bool ret = worker_set_->ExecuteRR(task);
+  if (!ret) {
+    brpc::ClosureGuard done_guard(svr_done);
+    ServiceHelper::SetError(response->mutable_error(), pb::error::EREQUEST_FULL, "Commit execute queue failed");
+  }
+}
+
 }  // namespace dingodb
