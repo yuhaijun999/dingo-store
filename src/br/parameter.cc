@@ -45,7 +45,7 @@ DEFINE_int32(br_server_interaction_max_retry, 5, "br server interaction  max ret
 // DEFINE_int64(br_server_interaction_timeout_ms, 60000, "br server interaction connect timeout . default 60000 ms");
 DEFINE_int64(br_server_interaction_timeout_ms, 60000, "br server interaction connect timeout . default 60000 ms");
 
-DEFINE_bool(br_log_switch_backup_detail, true, "backup detail log");
+DEFINE_bool(br_log_switch_backup_detail, false, "backup detail log");
 
 DEFINE_bool(br_log_switch_backup_detail_detail, false, "backup detail detail log");
 
@@ -53,7 +53,7 @@ DEFINE_string(br_log_dir, "./log", "backup log dir. default ./log");
 
 DEFINE_string(br_restore_type, "full", "restore  type. default: full.");
 
-DEFINE_bool(br_log_switch_restore_detail, true, "restore detail log");
+DEFINE_bool(br_log_switch_restore_detail, false, "restore detail log");
 
 DEFINE_bool(br_log_switch_restore_detail_detail, false, "restore detail detail log");
 
@@ -80,5 +80,13 @@ DEFINE_int64(create_region_timeout_s, 60, "restore create region to coordinator 
 
 // restore region timeout s (second)
 DEFINE_int64(restore_region_timeout_s, 600, "restore region timeout s. default 600s");
+
+// br backup  version comparison dingo-store version comparison
+DEFINE_bool(backup_strict_version_comparison, true,
+            "br backup version vs dingo-store version must be consistent. default true.");
+
+// br restore  version comparison dingo-store version comparison
+DEFINE_bool(restore_strict_version_comparison, false,
+            "br restore version vs dingo-store version must be consistent. default true.");
 
 }  // namespace br

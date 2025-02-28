@@ -51,6 +51,8 @@ class ServerInteraction {
   static butil::Status CreateInteraction(const std::vector<std::string>& addrs,
                                          std::shared_ptr<ServerInteraction>& interaction);
 
+  static butil::Status CreateInteraction(const std::string& addrs, std::shared_ptr<ServerInteraction>& interaction);
+
   bool Init(const std::string& addrs);
   bool Init(std::vector<std::string> addrs);
 
