@@ -56,8 +56,9 @@ butil::Status RestoreRegionData::Init() {
 
   DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << backup_data_file_value_sst_meta_group_->DebugString();
 
-  group_debug_info_ = fmt::format("{}_{} : {}({}):", backup_meta_region_cf_name_, group_belongs_to_whom_,
-                                  region_->definition().name(), region_->id());
+  group_debug_info_ =
+      fmt::format("backup_meta_region_cf_name:{} group_belongs_to_whom:{} region_name:{} region_id:{}",
+                  backup_meta_region_cf_name_, group_belongs_to_whom_, region_->definition().name(), region_->id());
 
   return butil::Status::OK();
 }
@@ -156,11 +157,13 @@ butil::Status RestoreRegionData::SendRegionRequest(const std::string& service_na
 
     request.mutable_sst_metas()->CopyFrom(*backup_data_file_value_sst_meta_group_);
 
-    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail_detail) << request.DebugString();
+    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << request.DebugString();
+    // DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail_detail) << request.DebugString();
 
     status = interaction_->SendRequest(service_name, api_name, request, response, restore_region_timeout_s_ * 1000);
 
-    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail_detail) << response.DebugString();
+    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << response.DebugString();
+    // DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail_detail) << response.DebugString();
 
     if (status.ok()) {
       if (response.error().errcode() == dingodb::pb::error::OK) {

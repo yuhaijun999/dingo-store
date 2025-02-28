@@ -79,6 +79,7 @@ butil::Status RestoreRegionDataManager::Run() {
   butil::Status status;
 
   uint32_t concurrency = std::min(concurrency_, static_cast<uint32_t>(sst_meta_groups_.size()));
+  int64_t sst_meta_groups_size = sst_meta_groups_.size();
 
   // init thread_exit_flags_ set already exit
   thread_exit_flags_.resize(concurrency, 1);
@@ -105,13 +106,16 @@ butil::Status RestoreRegionDataManager::Run() {
       break;
     }
 
-    if (already_restore_region_datas_ >= sst_meta_groups_.size()) {
+    if (already_restore_region_datas_ >= sst_meta_groups_size) {
       break;
     }
 
-    // check thread create failed
-    if (last_error_.error_code() != dingodb::pb::error::OK) {
-      break;
+    {
+      BAIDU_SCOPED_LOCK(mutex_);
+      // check thread create failed
+      if (last_error_.error_code() != dingodb::pb::error::OK) {
+        break;
+      }
     }
 
     sleep(1);
@@ -156,7 +160,7 @@ butil::Status RestoreRegionDataManager::DoAsyncRestoreRegionData(uint32_t thread
   ServerInteractionPtr internal_coordinator_interaction;
 
   butil::Status status =
-      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), coordinator_interaction_);
+      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), internal_coordinator_interaction);
   if (!status.ok()) {
     DINGO_LOG(ERROR) << status.error_cstr();
     return status;
