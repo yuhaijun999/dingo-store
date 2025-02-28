@@ -113,7 +113,7 @@ class Restore : public std::enable_shared_from_this<Restore> {
   bool is_already_register_restore_to_coordinator_;
 
   // is exit register restore to coordinator thread. default true.
-  bool is_exit_register_restore_to_coordinator_thread_;
+  std::atomic<bool> is_exit_register_restore_to_coordinator_thread_;
 
   bool region_auto_split_enable_after_finish_;
   bool region_auto_merge_enable_after_finish_;

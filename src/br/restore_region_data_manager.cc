@@ -51,11 +51,13 @@ RestoreRegionDataManager::RestoreRegionDataManager(
       restoretso_internal_(restoretso_internal),
       storage_(storage),
       storage_internal_(storage_internal),
-      id_and_sst_meta_group_kvs_(id_and_sst_meta_group_kvs),
       backup_meta_region_cf_name_(backup_meta_region_cf_name),
       group_belongs_to_whom_(group_belongs_to_whom),
       restore_region_timeout_s_(restore_region_timeout_s),
-      id_and_region_kvs_(id_and_region_kvs) {
+      id_and_region_kvs_(id_and_region_kvs),
+      id_and_sst_meta_group_kvs_(id_and_sst_meta_group_kvs),
+      is_need_exit_(false),
+      already_restore_region_datas_(0) {
   bthread_mutex_init(&mutex_, nullptr);
 }
 
@@ -72,6 +74,33 @@ butil::Status RestoreRegionDataManager::Init() {
     iter++;
   }
 
+  std::string s = fmt::format("backup_meta_region_cf_name : {} regions size : {}", backup_meta_region_cf_name_,
+                              sst_meta_groups_.size());
+
+  s += " regions : \n";
+
+  for (size_t i = 0; i < sst_meta_groups_.size(); i++) {
+    s += "[" + std::to_string(i) + "] ";
+
+    if (sst_meta_groups_[i]->backup_data_file_value_sst_metas_size() > 0) {
+      auto region_id = sst_meta_groups_[i]->backup_data_file_value_sst_metas(0).region_id();
+      s += std::to_string(region_id);
+      for (size_t j = 0; j < sst_meta_groups_[i]->backup_data_file_value_sst_metas_size(); j++) {
+        s += "-";
+        s += sst_meta_groups_[i]->backup_data_file_value_sst_metas(j).cf();
+      }
+    } else {
+      s += "empty";
+    }
+    s += "\n";
+  }
+
+  DINGO_LOG(INFO) << s;
+
+  if (sst_meta_groups_.size() > 1) {
+    std::reverse(sst_meta_groups_.begin(), sst_meta_groups_.end());
+  }
+
   return butil::Status::OK();
 }
 
@@ -79,6 +108,7 @@ butil::Status RestoreRegionDataManager::Run() {
   butil::Status status;
 
   uint32_t concurrency = std::min(concurrency_, static_cast<uint32_t>(sst_meta_groups_.size()));
+  int64_t sst_meta_groups_size = sst_meta_groups_.size();
 
   // init thread_exit_flags_ set already exit
   thread_exit_flags_.resize(concurrency, 1);
@@ -105,13 +135,16 @@ butil::Status RestoreRegionDataManager::Run() {
       break;
     }
 
-    if (already_restore_region_datas_ >= sst_meta_groups_.size()) {
+    if (already_restore_region_datas_ >= sst_meta_groups_size) {
       break;
     }
 
-    // check thread create failed
-    if (last_error_.error_code() != dingodb::pb::error::OK) {
-      break;
+    {
+      BAIDU_SCOPED_LOCK(mutex_);
+      // check thread create failed
+      if (last_error_.error_code() != dingodb::pb::error::OK) {
+        break;
+      }
     }
 
     sleep(1);
@@ -119,8 +152,9 @@ butil::Status RestoreRegionDataManager::Run() {
 
   // check thread exit
   int64_t start_time_s = dingodb::Helper::Timestamp();
-  int64_t end_time_s = start_time_s;
+
   while (true) {
+    int64_t end_time_s = dingodb::Helper::Timestamp();
     if ((end_time_s - start_time_s) > restore_region_timeout_s_) {
       DINGO_LOG(ERROR) << fmt::format("restore region data timeout : {}s", (end_time_s - start_time_s));
       break;
@@ -156,7 +190,7 @@ butil::Status RestoreRegionDataManager::DoAsyncRestoreRegionData(uint32_t thread
   ServerInteractionPtr internal_coordinator_interaction;
 
   butil::Status status =
-      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), coordinator_interaction_);
+      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), internal_coordinator_interaction);
   if (!status.ok()) {
     DINGO_LOG(ERROR) << status.error_cstr();
     return status;
@@ -215,8 +249,10 @@ butil::Status RestoreRegionDataManager::DoRestoreRegionDataInternal(ServerIntera
     {
       BAIDU_SCOPED_LOCK(mutex_);
       if (!sst_meta_groups_.empty()) {
-        sst_meta_group = sst_meta_groups_.front();
-        sst_meta_groups_.erase(sst_meta_groups_.begin());
+        // sst_meta_group = sst_meta_groups_.front();
+        // sst_meta_groups_.erase(sst_meta_groups_.begin());
+        sst_meta_group = sst_meta_groups_.back();
+        sst_meta_groups_.pop_back();
       } else {
         // empty regions. thread exit
         break;

@@ -125,6 +125,7 @@ class RestoreDataBase {
   int64_t create_region_timeout_s_;
   int64_t restore_region_timeout_s_;
   int32_t replica_num_;
+  // dingodb::Constant::kSqlData; dingodb::Constant::kSdkData
   std::string type_name_;
 };
 

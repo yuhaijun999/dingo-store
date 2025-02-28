@@ -14,6 +14,7 @@
 
 #include "br/restore_region_meta_manager.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -64,6 +65,28 @@ butil::Status RestoreRegionMetaManager::Init() {
     iter++;
   }
 
+  std::string s =
+      fmt::format("backup_meta_region_name : {} regions size : {}", backup_meta_region_name_, regions_.size());
+
+  s += " regions : [\n";
+
+  for (size_t i = 0; i < regions_.size(); i++) {
+    s += " " + std::to_string((regions_[i])->id());
+    if ((i + 1) % 10 == 0) {
+      s += "\n";
+    }
+  }
+  s += "]";
+
+  DINGO_LOG(INFO) << s;
+
+  if (regions_.size() > 1) {
+    std::reverse(regions_.begin(), regions_.end());
+  }
+
+  // std::mt19937 rng(std::random_device{}());
+  // std::shuffle(regions_.begin(), regions_.end(), rng);
+
   return butil::Status::OK();
 }
 
@@ -71,6 +94,7 @@ butil::Status RestoreRegionMetaManager::Run() {
   butil::Status status;
 
   uint32_t concurrency = std::min(concurrency_, static_cast<uint32_t>(regions_.size()));
+  int64_t regions_size = regions_.size();
 
   // init thread_exit_flags_ set already exit
   thread_exit_flags_.resize(concurrency, 1);
@@ -97,13 +121,16 @@ butil::Status RestoreRegionMetaManager::Run() {
       break;
     }
 
-    if (already_restore_region_metas_ >= regions_.size()) {
+    if (already_restore_region_metas_ >= regions_size) {
       break;
     }
 
-    // check thread create failed
-    if (last_error_.error_code() != dingodb::pb::error::OK) {
-      break;
+    {
+      BAIDU_SCOPED_LOCK(mutex_);
+      // check thread create failed
+      if (last_error_.error_code() != dingodb::pb::error::OK) {
+        break;
+      }
     }
 
     sleep(1);
@@ -112,8 +139,8 @@ butil::Status RestoreRegionMetaManager::Run() {
   // check thread exit
   int64_t wait_all_thread_exit_timeout_s = create_region_timeout_s_ + 5;
   int64_t start_time_s = dingodb::Helper::Timestamp();
-  int64_t end_time_s = start_time_s;
   while (true) {
+    int64_t end_time_s = dingodb::Helper::Timestamp();
     if ((end_time_s - start_time_s) > wait_all_thread_exit_timeout_s) {
       DINGO_LOG(ERROR) << fmt::format("restore region meta timeout : {}s. force exit !!!", (end_time_s - start_time_s));
       break;
@@ -149,7 +176,7 @@ butil::Status RestoreRegionMetaManager::DoAsyncRestoreRegionMeta(uint32_t thread
   ServerInteractionPtr internal_coordinator_interaction;
 
   butil::Status status =
-      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), coordinator_interaction_);
+      ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), internal_coordinator_interaction);
   if (!status.ok()) {
     DINGO_LOG(ERROR) << status.error_cstr();
     return status;
@@ -199,8 +226,10 @@ butil::Status RestoreRegionMetaManager::DoBackupRegionInternal(ServerInteraction
     {
       BAIDU_SCOPED_LOCK(mutex_);
       if (!regions_.empty()) {
-        region = regions_.front();
-        regions_.erase(regions_.begin());
+        // region = regions_.front();
+        // regions_.erase(regions_.begin());
+        region = regions_.back();
+        regions_.pop_back();
       } else {
         // empty regions. thread exit
         break;

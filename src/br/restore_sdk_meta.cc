@@ -44,7 +44,11 @@ std::shared_ptr<RestoreSdkMeta> RestoreSdkMeta::GetSelf() { return shared_from_t
 butil::Status RestoreSdkMeta::Init() {
   butil::Status status;
 
-  DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << coordinator_sdk_meta_sst_->DebugString();
+  if (coordinator_sdk_meta_sst_) {
+    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << coordinator_sdk_meta_sst_->DebugString();
+  } else {
+    DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << "coordinator_sdk_meta_sst_ = nullptr";
+  }
 
   status = CheckCoordinatorSdkMetaSst();
   if (!status.ok()) {
@@ -64,11 +68,13 @@ butil::Status RestoreSdkMeta::Init() {
 butil::Status RestoreSdkMeta::Run() {
   butil::Status status;
 
-  status = ImportSdkMetaToCoordinator();
-  if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
-    return status;
-  }
+  if (meta_all_) {
+    status = ImportSdkMetaToCoordinator();
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << status.error_cstr();
+      return status;
+    }
+  }  // if (meta_all_)
 
   return butil::Status::OK();
 }
@@ -78,13 +84,23 @@ butil::Status RestoreSdkMeta::Finish() { return butil::Status::OK(); }
 butil::Status RestoreSdkMeta::CheckCoordinatorSdkMetaSst() {
   butil::Status status;
 
-  status = Utils::CheckBackupMeta(coordinator_sdk_meta_sst_, storage_internal_,
-                                  dingodb::Constant::kCoordinatorSdkMetaSstName, "",
-                                  dingodb::Constant::kCoordinatorRegionName);
-  if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
-    return status;
-  }
+  if (coordinator_sdk_meta_sst_) {
+    std::string file_name = dingodb::Constant::kCoordinatorSdkMetaSstName;
+    std::string file_path = storage_internal_ + "/" + file_name;
+    status = Utils::FileExistsAndRegular(file_path);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << status.error_cstr();
+      return status;
+    }
+
+    status = Utils::CheckBackupMeta(coordinator_sdk_meta_sst_, storage_internal_,
+                                    dingodb::Constant::kCoordinatorSdkMetaSstName, "",
+                                    dingodb::Constant::kCoordinatorRegionName);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << status.error_cstr();
+      return status;
+    }
+  }  // if (coordinator_sdk_meta_sst_)
 
   return butil::Status::OK();
 }
@@ -92,33 +108,35 @@ butil::Status RestoreSdkMeta::CheckCoordinatorSdkMetaSst() {
 butil::Status RestoreSdkMeta::ExtractFromCoordinatorSdkMetaSst() {
   butil::Status status;
 
-  std::string file_path = storage_internal_ + "/" + coordinator_sdk_meta_sst_->file_name();
+  if (coordinator_sdk_meta_sst_) {
+    std::string file_path = storage_internal_ + "/" + coordinator_sdk_meta_sst_->file_name();
 
-  SstFileReader sst_file_reader;
-  std::map<std::string, std::string> internal_coordinator_sdk_meta_kvs;
-  status = sst_file_reader.ReadFile(file_path, internal_coordinator_sdk_meta_kvs);
-  if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
-    return status;
-  }
+    SstFileReader sst_file_reader;
+    std::map<std::string, std::string> internal_coordinator_sdk_meta_kvs;
+    status = sst_file_reader.ReadFile(file_path, internal_coordinator_sdk_meta_kvs);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << status.error_cstr();
+      return status;
+    }
 
-  // find kCoordinatorSdkMetaKeyName
-  auto iter = internal_coordinator_sdk_meta_kvs.find(dingodb::Constant::kCoordinatorSdkMetaKeyName);
-  if (iter == internal_coordinator_sdk_meta_kvs.end()) {
-    std::string s =
-        fmt::format("not found {} in coordinator.sdk.meta file.", dingodb::Constant::kCoordinatorSdkMetaKeyName);
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(dingodb::pb::error::ERESTORE_NOT_FOUND_KEY_IN_FILE, s);
-  }
+    // find kCoordinatorSdkMetaKeyName
+    auto iter = internal_coordinator_sdk_meta_kvs.find(dingodb::Constant::kCoordinatorSdkMetaKeyName);
+    if (iter == internal_coordinator_sdk_meta_kvs.end()) {
+      std::string s =
+          fmt::format("not found {} in coordinator.sdk.meta file.", dingodb::Constant::kCoordinatorSdkMetaKeyName);
+      DINGO_LOG(ERROR) << s;
+      return butil::Status(dingodb::pb::error::ERESTORE_NOT_FOUND_KEY_IN_FILE, s);
+    }
 
-  dingodb::pb::meta::MetaALL meta_all;
-  if (!meta_all.ParseFromString(iter->second)) {
-    std::string s =
-        fmt::format("parse dingodb::pb::meta::MetaALL failed : {}", dingodb::Constant::kCoordinatorSdkMetaKeyName);
-    return butil::Status(dingodb::pb::error::Errno::EINTERNAL, s);
-  }
+    dingodb::pb::meta::MetaALL meta_all;
+    if (!meta_all.ParseFromString(iter->second)) {
+      std::string s =
+          fmt::format("parse dingodb::pb::meta::MetaALL failed : {}", dingodb::Constant::kCoordinatorSdkMetaKeyName);
+      return butil::Status(dingodb::pb::error::Errno::EINTERNAL, s);
+    }
 
-  meta_all_ = std::make_shared<dingodb::pb::meta::MetaALL>(std::move(meta_all));
+    meta_all_ = std::make_shared<dingodb::pb::meta::MetaALL>(std::move(meta_all));
+  }  // if (coordinator_sdk_meta_sst_)
 
   return butil::Status::OK();
 }
