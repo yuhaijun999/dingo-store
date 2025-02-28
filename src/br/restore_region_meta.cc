@@ -45,8 +45,8 @@ butil::Status RestoreRegionMeta::Init() {
 
   DINGO_LOG_IF(INFO, FLAGS_br_log_switch_restore_detail) << region_->DebugString();
 
-  region_debug_info_ =
-      fmt::format("{} : {}({}):", backup_meta_region_name_, region_->definition().name(), region_->id());
+  region_debug_info_ = fmt::format("backup_meta_region_name:{} region name:{} region id:{} ", backup_meta_region_name_,
+                                   region_->definition().name(), region_->id());
 
   return butil::Status::OK();
 }
