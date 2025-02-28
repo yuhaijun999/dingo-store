@@ -54,6 +54,7 @@ class RestoreMeta : public std::enable_shared_from_this<RestoreMeta> {
 
   butil::Status ImportIdEpochTypeToMeta();
   butil::Status CreateAutoIncrementsToMeta();
+  std::pair<int64_t, int64_t> GetRegions();
 
  protected:
  private:

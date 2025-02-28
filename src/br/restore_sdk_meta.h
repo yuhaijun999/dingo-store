@@ -46,13 +46,14 @@ class RestoreSdkMeta : public std::enable_shared_from_this<RestoreSdkMeta> {
 
   butil::Status Finish();
 
+  std::pair<int64_t, int64_t> GetRegions();
+
  protected:
  private:
   butil::Status CheckCoordinatorSdkMetaSst();
   butil::Status ExtractFromCoordinatorSdkMetaSst();
-  butil::Status ImportSdkMetaToCoordinator() ;
+  butil::Status ImportSdkMetaToCoordinator();
   ServerInteractionPtr coordinator_interaction_;
-  ServerInteractionPtr store_interaction_;
   std::string restorets_;
   int64_t restoretso_internal_;
   std::string storage_;
