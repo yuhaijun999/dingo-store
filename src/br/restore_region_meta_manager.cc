@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "br/restore_region_meta.h"
+#include "br/utils.h"
 #include "common/constant.h"
 #include "common/helper.h"
 #include "fmt/core.h"
@@ -114,7 +115,7 @@ butil::Status RestoreRegionMetaManager::Run() {
 
     status = DoAsyncRestoreRegionMeta(i);
     if (!status.ok()) {
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -206,7 +207,7 @@ butil::Status RestoreRegionMetaManager::DoAsyncRestoreRegionMeta(uint32_t thread
   butil::Status status =
       ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), internal_coordinator_interaction);
   if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
+    DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
     return status;
   }
 
@@ -270,7 +271,7 @@ butil::Status RestoreRegionMetaManager::DoRestoreRegionInternal(ServerInteractio
     status = restore_region_meta->Init();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -281,7 +282,7 @@ butil::Status RestoreRegionMetaManager::DoRestoreRegionInternal(ServerInteractio
     status = restore_region_meta->Run();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -292,7 +293,7 @@ butil::Status RestoreRegionMetaManager::DoRestoreRegionInternal(ServerInteractio
     status = restore_region_meta->Finish();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;

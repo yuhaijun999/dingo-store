@@ -22,6 +22,7 @@
 #include <thread>
 
 #include "br/restore_region_data.h"
+#include "br/utils.h"
 #include "common/constant.h"
 #include "common/helper.h"
 #include "fmt/core.h"
@@ -134,7 +135,7 @@ butil::Status RestoreRegionDataManager::Run() {
 
     status = DoAsyncRestoreRegionData(i);
     if (!status.ok()) {
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -233,7 +234,7 @@ butil::Status RestoreRegionDataManager::DoAsyncRestoreRegionData(uint32_t thread
   butil::Status status =
       ServerInteraction::CreateInteraction(coordinator_interaction_->GetAddrs(), internal_coordinator_interaction);
   if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
+    DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
     return status;
   }
 
@@ -241,7 +242,7 @@ butil::Status RestoreRegionDataManager::DoAsyncRestoreRegionData(uint32_t thread
 
   status = ServerInteraction::CreateInteraction(interaction_->GetAddrs(), internal_interaction);
   if (!status.ok()) {
-    DINGO_LOG(ERROR) << status.error_cstr();
+    DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
     return status;
   }
 
@@ -315,7 +316,7 @@ butil::Status RestoreRegionDataManager::DoRestoreRegionDataInternal(ServerIntera
         std::string s = fmt::format("region id : {} not found", region_id);
         DINGO_LOG(ERROR) << s;
         is_need_exit_ = true;
-        DINGO_LOG(ERROR) << status.error_cstr();
+        DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
         {
           BAIDU_SCOPED_LOCK(mutex_);
           last_error_ = status;
@@ -332,7 +333,7 @@ butil::Status RestoreRegionDataManager::DoRestoreRegionDataInternal(ServerIntera
     status = restore_region_data->Init();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -343,7 +344,7 @@ butil::Status RestoreRegionDataManager::DoRestoreRegionDataInternal(ServerIntera
     status = restore_region_data->Run();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;
@@ -354,7 +355,7 @@ butil::Status RestoreRegionDataManager::DoRestoreRegionDataInternal(ServerIntera
     status = restore_region_data->Finish();
     if (!status.ok()) {
       is_need_exit_ = true;
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       {
         BAIDU_SCOPED_LOCK(mutex_);
         last_error_ = status;

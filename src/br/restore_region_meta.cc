@@ -20,6 +20,7 @@
 
 #include "br/helper.h"
 #include "br/parameter.h"
+#include "br/utils.h"
 #include "fmt/core.h"
 #include "fmt/format.h"
 #include "proto/common.pb.h"
@@ -94,7 +95,7 @@ butil::Status RestoreRegionMeta::CreateRegionToCoordinator() {
     status = coordinator_interaction_->SendRequest("CoordinatorService", "CreateRegion", request, response,
                                                    create_region_timeout_s_ * 1000);
     if (!status.ok()) {
-      DINGO_LOG(ERROR) << status.error_cstr();
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       return status;
     }
 
