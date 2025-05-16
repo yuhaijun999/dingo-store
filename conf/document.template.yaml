@@ -14,10 +14,10 @@ server:
   # worker_thread_num: 36 # must >4, worker_thread_num priority worker_thread_ratio
   worker_thread_ratio: 4 # cpu core * ratio
 region:
-  region_max_size: 536870912 # 512MB
-  enable_auto_split: true
+  region_max_size: 4294967296 # 4G
+  enable_auto_split: false
   split_check_interval_s: 120
-  enable_auto_merge: true
+  enable_auto_merge: false
   merge_check_interval_s: 120
   region_merge_min_size: 1048576 # 1MB
   region_merge_min_keys_count: 10000
