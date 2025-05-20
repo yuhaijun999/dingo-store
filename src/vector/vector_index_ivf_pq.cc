@@ -327,9 +327,12 @@ bool VectorIndexIvfPq::IsExceedsMaxElements(int64_t /*vector_size*/) { return fa
 butil::Status VectorIndexIvfPq::Train(std::vector<float>& train_datas) {
   size_t data_size = train_datas.size() / dimension_;
   if (data_size == 0) {
+    DINGO_LOG(ERROR) << fmt::format("[vector_index.ivf_pq][id({})] train data size invalid", Id());
     return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "data size invalid");
   }
   if (train_datas.size() % dimension_ != 0) {
+    DINGO_LOG(ERROR) << fmt::format("[vector_index.ivf_pq][id({})] dimension not match {} {}", Id(), train_datas.size(),
+                                    dimension_);
     return butil::Status(pb::error::EILLEGAL_PARAMTETERS,
                          fmt::format("dimension not match {} {}", train_datas.size(), dimension_));
   }
@@ -346,6 +349,8 @@ butil::Status VectorIndexIvfPq::Train(std::vector<float>& train_datas) {
   RWLockWriteGuard guard(&rw_lock_);
 
   if (BAIDU_UNLIKELY(IsTrainedImpl())) {
+    DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] already trained, train index type:{}", Id(),
+                                   static_cast<int>(inner_index_type_));
     return butil::Status::OK();
   }
 
@@ -399,7 +404,9 @@ butil::Status VectorIndexIvfPq::Train(const std::vector<pb::common::VectorWithId
   train_datas.reserve(dimension_ * vectors.size());
   for (const auto& vector : vectors) {
     if (BAIDU_UNLIKELY(dimension_ != vector.vector().float_values().size())) {
-      std::string s = fmt::format("dimension not match {} {}", vector.vector().float_values().size(), dimension_);
+      std::string s =
+          fmt::format("ivf_pq dimension not match {} {}", vector.vector().float_values().size(), dimension_);
+      DINGO_LOG(ERROR) << s;
       return butil::Status(pb::error::Errno::EINTERNAL, s);
     }
     train_datas.insert(train_datas.end(), vector.vector().float_values().begin(), vector.vector().float_values().end());
@@ -425,11 +432,17 @@ bool VectorIndexIvfPq::NeedToRebuild() {
       int64_t count = 0;
       index_flat_->GetCount(count);
       if (count >= data_size) {
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] now is flat. need to rebuild, count: {} data_size: {}", Id(), count,
+            data_size);
         return true;
       }
       break;
     }
     case IndexTypeInIvfPq::kIvfPq: {
+      if (index_raw_ivf_pq_->NeedToRebuild()) {
+        DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] now is ivf_pq. need to rebuild", Id());
+      }
       return index_raw_ivf_pq_->NeedToRebuild();
     }
     case IndexTypeInIvfPq::kUnknow:
