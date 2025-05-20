@@ -9,7 +9,7 @@ server:
   heartbeat_interval_s: 6
   metrics_collect_interval_s: 300
   approximate_size_metrics_collect_interval_s: 300
-  scrub_vector_index_interval_s: 60
+  scrub_vector_index_interval_s: 10
   get_tso_interval_ms: 1000
   # worker_thread_num: 36 # must >4, worker_thread_num priority worker_thread_ratio
   worker_thread_ratio: 4 # cpu core * ratio
