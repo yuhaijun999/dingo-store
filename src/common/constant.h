@@ -167,7 +167,7 @@ class Constant {
 
   static const uint32_t kLoadOrBuildVectorIndexConcurrency = 5;
 
-  static const uint32_t kBuildVectorIndexBatchSize = 32768;
+  static const uint32_t kBuildVectorIndexBatchSize = 100000;  // 10K
 
   static const uint32_t kBuildDocumentIndexBatchSize = 32768;
 
