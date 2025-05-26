@@ -14,6 +14,6 @@ log:
 store:
   path: $BASE_PATH$/data/diskann
   num_threads: 64
-  search_dram_budget_gb: 1.0
-  build_dram_budget_gb: 10.0
+  search_dram_budget_gb: 10.0
+  build_dram_budget_gb: 100.0
   import_timeout_s: 30
