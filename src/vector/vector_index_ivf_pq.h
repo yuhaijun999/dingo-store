@@ -110,7 +110,7 @@ class VectorIndexIvfPq : public VectorIndex {
 
   int32_t nbits_per_idx_;
 
-  std::unique_ptr<VectorIndexFlat<faiss::Index,faiss::IndexIDMap2>> index_flat_;
+  std::unique_ptr<VectorIndexFlat<faiss::Index, faiss::IndexIDMap2>> index_flat_;
 
   std::unique_ptr<VectorIndexRawIvfPq> index_raw_ivf_pq_;
 
@@ -124,6 +124,12 @@ class VectorIndexIvfPq : public VectorIndex {
   template <typename FLAT_FUNC_PTR, typename PQ_FUNC_PTR, typename... Args>
   butil::Status InvokeConcreteFunction(const char* name, FLAT_FUNC_PTR flat_func_ptr, PQ_FUNC_PTR pq_func_ptr,
                                        bool use_glog, Args&&... args);
+  const char* GetInnerIndexTypeName() const;
+
+  int64_t last_add_or_upsert_second_ = 0;
+
+  std::atomic<bool> is_first_add_or_upsert_{true};
+  std::atomic<bool> is_first_search_{true};
 };
 
 }  // namespace dingodb
