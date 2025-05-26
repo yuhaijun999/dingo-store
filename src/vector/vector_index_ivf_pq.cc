@@ -25,12 +25,15 @@
 #include "butil/compiler_specific.h"
 #include "butil/status.h"
 #include "common/constant.h"
+#include "common/helper.h"
 #include "common/logging.h"
 #include "common/threadpool.h"
 #include "faiss/MetricType.h"
 #include "faiss/impl/ProductQuantizer.h"
 #include "faiss/index_io.h"
 #include "fmt/core.h"
+#include "fmt/format.h"
+#include "gflags/gflags.h"
 #include "proto/common.pb.h"
 #include "proto/debug.pb.h"
 #include "proto/error.pb.h"
@@ -38,6 +41,9 @@
 #include "vector/vector_index_utils.h"
 
 namespace dingodb {
+
+DEFINE_uint32(ivf_pq_need_to_rebuild_after_add_or_upsert_seconds, 5,
+              "if the ivf_pq index is not trained, it will rebuild after this seconds when add or upsert");
 
 bvar::LatencyRecorder g_ivf_pq_upsert_latency("dingo_ivf_pq_upsert_latency");
 bvar::LatencyRecorder g_ivf_pq_search_latency("dingo_ivf_pq_search_latency");
@@ -86,6 +92,13 @@ butil::Status VectorIndexIvfPq::AddOrUpsertWrapper(const std::vector<pb::common:
                                     &VectorIndexFlat<faiss::Index, faiss::IndexIDMap2>::AddOrUpsertWrapper,
                                     &VectorIndexRawIvfPq::AddOrUpsertWrapper, true, vector_with_ids, is_upsert);
     if (status.ok()) {
+      last_add_or_upsert_second_ = Helper::Timestamp();
+      if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
+        is_first_add_or_upsert_ = false;
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x}", Id(),
+            static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this));
+      }
       return status;
     } else if (!status.ok() && pb::error::Errno::EVECTOR_NOT_TRAIN != status.error_code()) {
       return status;
@@ -104,6 +117,16 @@ butil::Status VectorIndexIvfPq::AddOrUpsertWrapper(const std::vector<pb::common:
     status = InvokeConcreteFunction("AddOrUpsertWrapper",
                                     &VectorIndexFlat<faiss::Index, faiss::IndexIDMap2>::AddOrUpsertWrapper,
                                     &VectorIndexRawIvfPq::AddOrUpsertWrapper, true, vector_with_ids, is_upsert);
+  }
+
+  if (status.ok()) {
+    last_add_or_upsert_second_ = Helper::Timestamp();
+    if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
+      is_first_add_or_upsert_ = false;
+      DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x}",
+                                     Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(),
+                                     reinterpret_cast<int64_t>(this));
+    }
   }
 
   return status;
@@ -160,6 +183,13 @@ butil::Status VectorIndexIvfPq::Search(const std::vector<pb::common::VectorWithI
     for (size_t row = 0; row < vector_with_ids.size(); ++row) {
       auto& result = results.emplace_back();
     }
+  }
+
+  if (BAIDU_UNLIKELY(is_first_search_)) {
+    is_first_search_ = false;
+    DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] now is {}({}) .  first search.  this : {:#x}", Id(),
+                                   static_cast<int>(inner_index_type_), GetInnerIndexTypeName(),
+                                   reinterpret_cast<int64_t>(this));
   }
 
   return butil::Status::OK();
@@ -349,15 +379,15 @@ butil::Status VectorIndexIvfPq::Train(std::vector<float>& train_datas) {
   RWLockWriteGuard guard(&rw_lock_);
 
   if (BAIDU_UNLIKELY(IsTrainedImpl())) {
-    DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] already trained, train index type:{}", Id(),
-                                   static_cast<int>(inner_index_type_));
+    DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] already trained, train index type:{}({})", Id(),
+                                   static_cast<int>(inner_index_type_), GetInnerIndexTypeName());
     return butil::Status::OK();
   }
 
   inner_index_type_ = data_size >= std::max(train_nlist_size, train_subvector_size) ? IndexTypeInIvfPq::kIvfPq
                                                                                     : IndexTypeInIvfPq::kFlat;
-  DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] train index type: {} data_size: {}", Id(),
-                                 static_cast<int>(inner_index_type_), data_size);
+  DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] train index type: {}({}) data_size: {}", Id(),
+                                 static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), data_size);
 
   // init index
   Init();
@@ -377,6 +407,7 @@ butil::Status VectorIndexIvfPq::Train(std::vector<float>& train_datas) {
       break;
     }
     case IndexTypeInIvfPq::kIvfPq: {
+      auto start_time_s = Helper::Timestamp();
       status = index_raw_ivf_pq_->Train(train_datas);
       if (!status.ok()) {
         Reset();
@@ -386,6 +417,27 @@ butil::Status VectorIndexIvfPq::Train(std::vector<float>& train_datas) {
         Reset();
         return butil::Status(pb::error::Errno::EINTERNAL, "check raw_ivf_pq index train failed");
       }
+      auto end_time_s = Helper::Timestamp();
+      int64_t hours = (end_time_s - start_time_s) / 3600;
+      int64_t minutes = (end_time_s - start_time_s) / 60;
+
+      if (hours > 0) {
+        minutes = (end_time_s - start_time_s) % 3600 / 60;
+        auto seconds = (end_time_s - start_time_s) % 60;
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] train index type: {}({}) data_size: {} cost time : {} h {} m {} s", Id(),
+            static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), data_size, hours, minutes, seconds);
+      } else if (minutes > 0) {
+        auto seconds = (end_time_s - start_time_s) % 60;
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] train index type: {}({}) data_size: {} cost time : {} m {} s", Id(),
+            static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), data_size, minutes, seconds);
+      } else {
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] train index type: {}({}) data_size: {} cost time : {} s", Id(),
+            static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), data_size, (end_time_s - start_time_s));
+      }
+
       break;
     }
     case IndexTypeInIvfPq::kUnknow:
@@ -431,17 +483,24 @@ bool VectorIndexIvfPq::NeedToRebuild() {
       auto data_size = std::max(train_nlist_size, train_subvector_size);
       int64_t count = 0;
       index_flat_->GetCount(count);
-      if (count >= data_size) {
+      auto now = Helper::Timestamp();
+      if (count >= data_size &&
+          ((now - last_add_or_upsert_second_) > FLAGS_ivf_pq_need_to_rebuild_after_add_or_upsert_seconds)) {
         DINGO_LOG(INFO) << fmt::format(
-            "[vector_index.ivf_pq][id({})] now is flat. need to rebuild, count: {} data_size: {}", Id(), count,
-            data_size);
+            "[vector_index.ivf_pq][id({})] now is flat. need to rebuild, count: {} data_size: {} "
+            "after_add_or_upsert_seconds : {}",
+            Id(), count, data_size, (now - last_add_or_upsert_second_));
         return true;
       }
       break;
     }
     case IndexTypeInIvfPq::kIvfPq: {
-      if (index_raw_ivf_pq_->NeedToRebuild()) {
-        DINGO_LOG(INFO) << fmt::format("[vector_index.ivf_pq][id({})] now is ivf_pq. need to rebuild", Id());
+      auto now = Helper::Timestamp();
+      if (index_raw_ivf_pq_->NeedToRebuild() &&
+          ((now - last_add_or_upsert_second_) > FLAGS_ivf_pq_need_to_rebuild_after_add_or_upsert_seconds)) {
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] now is ivf_pq. need to rebuild after_add_or_upsert_seconds: {}", Id(),
+            (now - last_add_or_upsert_second_));
       }
       return index_raw_ivf_pq_->NeedToRebuild();
     }
@@ -515,9 +574,15 @@ void VectorIndexIvfPq::Init() {
     flat_parameter->set_dimension(vector_index_parameter.ivf_pq_parameter().dimension());
     index_flat_ = std::make_unique<VectorIndexFlat<faiss::Index, faiss::IndexIDMap2>>(id, index_parameter_flat, epoch,
                                                                                       range, thread_pool);
+    last_add_or_upsert_second_ = 0;
+    is_first_add_or_upsert_ = true;
+    is_first_search_ = true;
 
   } else if (IndexTypeInIvfPq::kIvfPq == inner_index_type_) {
     index_raw_ivf_pq_ = std::make_unique<VectorIndexRawIvfPq>(id, vector_index_parameter, epoch, range, thread_pool);
+    last_add_or_upsert_second_ = 0;
+    is_first_add_or_upsert_ = true;
+    is_first_search_ = true;
   } else {
     DINGO_LOG(ERROR) << fmt::format("[vector_index.ivf_pq][id({})] unknown index type.", Id());
   }
@@ -575,6 +640,18 @@ butil::Status VectorIndexIvfPq::InvokeConcreteFunction(const char* name, FLAT_FU
   }
 
   return butil::Status::OK();
+}
+
+const char* VectorIndexIvfPq::GetInnerIndexTypeName() const {
+  switch (inner_index_type_) {
+    case IndexTypeInIvfPq::kFlat:
+      return "IndexTypeInIvfPq::Flat";
+    case IndexTypeInIvfPq::kIvfPq:
+      return "IndexTypeInIvfPq::IvfPq";
+    case IndexTypeInIvfPq::kUnknow:
+    default:
+      return "IndexTypeInIvfPq::Unknow";
+  }
 }
 
 }  // namespace dingodb

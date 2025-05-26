@@ -1344,7 +1344,7 @@ butil::Status VectorIndexManager::ScrubVectorIndex() {
     if (need_rebuild && vector_index_wrapper->RebuildingNum() == 0) {
       DINGO_LOG(INFO) << fmt::format("[vector_index.scrub][index_id({})] need rebuild, do rebuild vector index.",
                                      vector_index_id);
-      LaunchRebuildVectorIndex(vector_index_wrapper, 0, true, false, false, "from scrub");
+      LaunchRebuildVectorIndex(vector_index_wrapper, 0, true, true, false, "from scrub");
       continue;
     }
 

@@ -470,7 +470,7 @@ butil::Status VectorIndexRawIvfPq::Train(std::vector<float>& train_datas) {
     return butil::Status::OK();
   }
 
-  DINGO_LOG(INFO) << fmt::format("[vector_index.raw_ivf_pq][id({})] train size: {}", Id(), train_datas.size());
+  DINGO_LOG(INFO) << fmt::format("[vector_index.raw_ivf_pq][id({})] data_ size: {}", Id(), data_size);
 
   // init index
   Init();
