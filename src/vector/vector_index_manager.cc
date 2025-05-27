@@ -881,6 +881,10 @@ VectorIndexPtr VectorIndexManager::BuildVectorIndex(VectorIndexWrapperPtr vector
     return nullptr;
   }
 
+  DINGO_LOG(INFO) << fmt::format(
+      "[vector_index.build][index_id({})][trace({})] Build vector index, range: {} parallel: {}", vector_index_id,
+      trace, vector_index->RangeString(), vector_index->WriteOpParallelNum());
+
   // diskann index only need to build index, no need to build data !!!
   if (pb::common::VectorIndexType::VECTOR_INDEX_TYPE_DISKANN == vector_index_wrapper->Type()) {
     return vector_index;
@@ -1369,6 +1373,9 @@ butil::Status VectorIndexManager::TrainForBuild(VectorIndexPtr vector_index, mvc
   auto iter = reader->NewIterator(Constant::kVectorDataCF, 0, options);
   CHECK(iter != nullptr) << fmt::format("[vector_index.build][index_id({})] NewIterator failed.", vector_index->Id());
 
+  DINGO_LOG(INFO) << fmt::format("[vector_index.build][index_id({})] Start train vector index, range: {}",
+                                 vector_index->Id(), vector_index->RangeString());
+
   std::vector<float> train_vectors;
   train_vectors.reserve(100000 * vector_index->GetDimension());  // todo opt
   for (iter->Seek(encode_range.start_key()); iter->Valid(); iter->Next()) {
@@ -1399,6 +1406,10 @@ butil::Status VectorIndexManager::TrainForBuild(VectorIndexPtr vector_index, mvc
                          vector.vector().float_values().end());
   }
 
+  DINGO_LOG(INFO) << fmt::format(
+      "[vector_index.build][index_id({})] train for scan vector index finish, train_vectors size: {}, range: {}",
+      vector_index->Id(), train_vectors.size() / vector_index->GetDimension(), vector_index->RangeString());
+
   if (!train_vectors.empty()) {
     auto status = vector_index->TrainByParallel(train_vectors);
     if (!status.ok()) {
@@ -1407,6 +1418,10 @@ butil::Status VectorIndexManager::TrainForBuild(VectorIndexPtr vector_index, mvc
       return status;
     }
   }
+
+  DINGO_LOG(INFO) << fmt::format(
+      "[vector_index.build][index_id({})] train vector index finish, train_vectors size: {}, range: {}",
+      vector_index->Id(), train_vectors.size() / vector_index->GetDimension(), vector_index->RangeString());
 
   return butil::Status::OK();
 }
