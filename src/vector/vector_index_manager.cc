@@ -801,7 +801,7 @@ butil::Status VectorIndexManager::ReplayWalToVectorIndex(VectorIndexPtr vector_i
       switch (request.cmd_type()) {
         case pb::raft::VECTOR_ADD: {
           if (!ids.empty()) {
-            vector_index->DeleteByParallel(ids, false);
+            vector_index->DeleteByParallel(ids, true);
             ids.clear();
           }
 
@@ -812,14 +812,14 @@ butil::Status VectorIndexManager::ReplayWalToVectorIndex(VectorIndexPtr vector_i
           }
 
           if (vectors.size() >= Constant::kBuildVectorIndexBatchSize) {
-            vector_index->UpsertByParallel(vectors, false);
+            vector_index->UpsertByParallel(vectors, true);
             vectors.clear();
           }
           break;
         }
         case pb::raft::VECTOR_DELETE: {
           if (!vectors.empty()) {
-            vector_index->UpsertByParallel(vectors, false);
+            vector_index->UpsertByParallel(vectors, true);
             vectors.clear();
           }
 
@@ -829,7 +829,7 @@ butil::Status VectorIndexManager::ReplayWalToVectorIndex(VectorIndexPtr vector_i
             }
           }
           if (ids.size() >= Constant::kBuildVectorIndexBatchSize) {
-            vector_index->DeleteByParallel(ids, false);
+            vector_index->DeleteByParallel(ids, true);
             ids.clear();
           }
           break;
@@ -842,9 +842,9 @@ butil::Status VectorIndexManager::ReplayWalToVectorIndex(VectorIndexPtr vector_i
     last_log_id = log_entry->index;
   }
   if (!vectors.empty()) {
-    vector_index->UpsertByParallel(vectors, false);
+    vector_index->UpsertByParallel(vectors, true);
   } else if (!ids.empty()) {
-    vector_index->DeleteByParallel(ids, false);
+    vector_index->DeleteByParallel(ids, true);
   }
 
   if (last_log_id > vector_index->ApplyLogId()) {
@@ -983,7 +983,8 @@ VectorIndexPtr VectorIndexManager::BuildVectorIndex(VectorIndexWrapperPtr vector
     if (++count % Constant::kBuildVectorIndexBatchSize == 0) {
       int64_t upsert_start_time = Helper::TimestampMs();
 
-      vector_index->AddByParallel(vectors, false);
+      // Add vectors to vector index modify primarily for index.
+      vector_index->AddByParallel(vectors, true);
 
       int32_t this_upsert_time = Helper::TimestampMs() - upsert_start_time;
       upsert_use_time += this_upsert_time;
@@ -996,14 +997,19 @@ VectorIndexPtr VectorIndexManager::BuildVectorIndex(VectorIndexWrapperPtr vector
 
       vectors.clear();
       // yield, for other bthread run.
-      bthread_yield();
+      // bthread_yield();
     }
   }
 
   if (!vectors.empty()) {
     int64_t upsert_start_time = Helper::TimestampMs();
-    vector_index->AddByParallel(vectors, false);
+    // Add vectors to vector index modify primarily for index.
+    vector_index->AddByParallel(vectors, true);
     upsert_use_time += (Helper::TimestampMs() - upsert_start_time);
+    DINGO_LOG(INFO) << fmt::format(
+        "[vector_index.build][index_id({})][trace({})] Build vector index progress,  "
+        "count({})",
+        vector_index_id, trace, count);
   }
 
   DINGO_LOG(INFO) << fmt::format(

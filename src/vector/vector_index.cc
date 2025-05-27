@@ -302,11 +302,14 @@ butil::Status VectorIndex::RangeSearchByParallel(
 butil::Status VectorIndex::TrainByParallel(std::vector<float>& train_datas) {
   butil::Status status;
 
-  DINGO_LOG(INFO) << fmt::format("[vector_index.train][index_id({})] train ready, vector data size({}).", Id(),
-                                 train_datas.size());
+  DINGO_LOG(INFO) << fmt::format(
+      "[vector_index.train][index_id({})] train ready, vector data size({}). total task count : {}.", Id(),
+      train_datas.size(), thread_pool->TotalTaskCount());
 
   uint64_t start_time = Helper::TimestampMs();
-  auto task = thread_pool->ExecuteTask([&](void*) { status = Train(train_datas); }, nullptr, 0);
+
+  // modify priority to 2, so that the task will be executed first
+  auto task = thread_pool->ExecuteTask([&](void*) { status = Train(train_datas); }, nullptr, 2);
 
   task->Join();
 
@@ -956,7 +959,7 @@ butil::Status VectorIndexWrapper::Add(const std::vector<pb::common::VectorWithId
     return status;
   }
 
-  auto status = vector_index->AddByParallel(vector_with_ids);
+  auto status = vector_index->AddByParallel(vector_with_ids, true);
   if (status.ok()) {
     write_key_count_ += vector_with_ids.size();
   }
@@ -1003,7 +1006,7 @@ butil::Status VectorIndexWrapper::Upsert(const std::vector<pb::common::VectorWit
     return status;
   }
 
-  auto status = vector_index->UpsertByParallel(vector_with_ids);
+  auto status = vector_index->UpsertByParallel(vector_with_ids, true);
   if (status.ok()) {
     write_key_count_ += vector_with_ids.size();
   }
