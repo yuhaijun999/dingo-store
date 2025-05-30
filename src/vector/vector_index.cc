@@ -256,7 +256,7 @@ butil::Status VectorIndex::SearchByParallel(const std::vector<pb::common::Vector
     SplitVectorWithId(vector_with_ids, FLAGS_vector_read_batch_size_per_task, vector_with_id_batchs);
 
     return ParallelRun(
-        thread_pool, Id(), vector_with_id_batchs, true,
+        thread_pool, Id(), vector_with_id_batchs, false,
         [&](const std::vector<pb::common::VectorWithId>& vector_with_ids, uint32_t index) -> butil::Status {
           std::vector<pb::index::VectorWithDistanceResult> part_results;
           auto status = Search(vector_with_ids, topk, filters, reconstruct, parameter, part_results);
