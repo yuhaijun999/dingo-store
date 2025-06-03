@@ -130,6 +130,7 @@ class VectorIndexIvfPq : public VectorIndex {
 
   std::atomic<bool> is_first_add_or_upsert_{true};
   std::atomic<bool> is_first_search_{true};
+  bthread_mutex_t mutex_;
 };
 
 }  // namespace dingodb
