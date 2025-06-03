@@ -70,9 +70,11 @@ VectorIndexIvfPq::VectorIndexIvfPq(int64_t id, const pb::common::VectorIndexPara
   nbits_per_idx_ = (vector_index_parameter.ivf_pq_parameter().nbits_per_idx() % 64) > 0
                        ? (vector_index_parameter.ivf_pq_parameter().nbits_per_idx() % 64)
                        : Constant::kCreateIvfPqParamNbitsPerIdx;
+
+  bthread_mutex_init(&mutex_, nullptr);
 }
 
-VectorIndexIvfPq::~VectorIndexIvfPq() = default;
+VectorIndexIvfPq::~VectorIndexIvfPq() { bthread_mutex_init(&mutex_, nullptr); }
 
 butil::Status VectorIndexIvfPq::AddOrUpsertWrapper(const std::vector<pb::common::VectorWithId>& vector_with_ids,
                                                    bool is_upsert) {
@@ -94,12 +96,15 @@ butil::Status VectorIndexIvfPq::AddOrUpsertWrapper(const std::vector<pb::common:
     if (status.ok()) {
       last_add_or_upsert_second_ = Helper::Timestamp();
       if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
-        is_first_add_or_upsert_ = false;
-        DINGO_LOG(INFO) << fmt::format(
-            "[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x} "
-            "last_add_or_upsert_second_ : {}({})",
-            Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
-            last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+        BAIDU_SCOPED_LOCK(mutex_);
+        if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
+          is_first_add_or_upsert_ = false;
+          DINGO_LOG(INFO) << fmt::format(
+              "[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x} "
+              "last_add_or_upsert_second_ : {}({})",
+              Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
+              last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+        }
       }
       return status;
     } else if (!status.ok() && pb::error::Errno::EVECTOR_NOT_TRAIN != status.error_code()) {
@@ -124,12 +129,15 @@ butil::Status VectorIndexIvfPq::AddOrUpsertWrapper(const std::vector<pb::common:
   if (status.ok()) {
     last_add_or_upsert_second_ = Helper::Timestamp();
     if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
-      is_first_add_or_upsert_ = false;
-      DINGO_LOG(INFO) << fmt::format(
-          "[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x} "
-          "last_add_or_upsert_second_ : {}({})",
-          Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
-          last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+      BAIDU_SCOPED_LOCK(mutex_);
+      if (BAIDU_UNLIKELY(is_first_add_or_upsert_)) {
+        is_first_add_or_upsert_ = false;
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.ivf_pq][id({})] now is {}({}) .  first add or upsert. this : {:#x} "
+            "last_add_or_upsert_second_ : {}({})",
+            Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
+            last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+      }
     }
   }
 
@@ -190,12 +198,15 @@ butil::Status VectorIndexIvfPq::Search(const std::vector<pb::common::VectorWithI
   }
 
   if (BAIDU_UNLIKELY(is_first_search_)) {
-    is_first_search_ = false;
-    DINGO_LOG(INFO) << fmt::format(
-        "[vector_index.ivf_pq][id({})] now is {}({}) .  first search.  this : {:#x} last_add_or_upsert_second_ : "
-        "{}({})",
-        Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
-        last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+    BAIDU_SCOPED_LOCK(mutex_);
+    if (BAIDU_UNLIKELY(is_first_search_)) {
+      is_first_search_ = false;
+      DINGO_LOG(INFO) << fmt::format(
+          "[vector_index.ivf_pq][id({})] now is {}({}) .  first search.  this : {:#x} last_add_or_upsert_second_ : "
+          "{}({})",
+          Id(), static_cast<int>(inner_index_type_), GetInnerIndexTypeName(), reinterpret_cast<int64_t>(this),
+          last_add_or_upsert_second_, Helper::FormatTime(last_add_or_upsert_second_, "%Y-%m-%d %H:%M:%S"));
+    }
   }
 
   return butil::Status::OK();
