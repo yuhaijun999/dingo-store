@@ -56,6 +56,7 @@ DEFINE_int32(vector_fast_background_worker_num, 8, "vector index fast background
 DEFINE_int64(vector_fast_build_log_gap, 50, "vector index fast build log gap");
 DEFINE_int64(vector_pull_snapshot_min_log_gap, 66, "vector index pull snapshot min log gap");
 DEFINE_int64(vector_max_background_task_count, 32, "vector index max background task count");
+DEFINE_bool(cancel_save_vector_index_snapshot, false, "cancel save vector index snapshot. default false");
 
 std::string RebuildVectorIndexTask::Trace() {
   return fmt::format("[vector_index.rebuild][id({}).start_time({}).job_id({})] {}", vector_index_wrapper_->Id(),
@@ -1267,15 +1268,38 @@ butil::Status VectorIndexManager::SaveVectorIndex(VectorIndexWrapperPtr vector_i
   DINGO_LOG(INFO) << fmt::format("[vector_index.save][index_id({}_v{})][trace({})] Save vector index.",
                                  vector_index_wrapper->Id(), vector_index_wrapper->Version(), trace);
 
-  int64_t snapshot_log_id = 0;
-  auto status = VectorIndexSnapshotManager::SaveVectorIndexSnapshot(vector_index_wrapper, snapshot_log_id);
-  if (!status.ok()) {
-    DINGO_LOG(ERROR) << fmt::format(
-        "[vector_index.save][index_id({})][trace({})] Save vector index snapshot failed, error: {} {}",
-        vector_index_wrapper->Id(), trace, status.error_code(), status.error_str());
-    return status;
-  } else {
-    vector_index_wrapper->SetSnapshotLogId(snapshot_log_id);
+  {
+    static std::atomic<int64_t> save_vector_index_num{0};
+
+    if (!FLAGS_cancel_save_vector_index_snapshot) {
+      if (save_vector_index_num.load() == 0) {
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.save][index_id({}_v{})][trace({})] FLAGS_cancel_save_vector_index_snapshot is false, enable "
+            "save.",
+            vector_index_wrapper->Id(), vector_index_wrapper->Version(), trace);
+      }
+
+      int64_t snapshot_log_id = 0;
+      auto status = VectorIndexSnapshotManager::SaveVectorIndexSnapshot(vector_index_wrapper, snapshot_log_id);
+      if (!status.ok()) {
+        save_vector_index_num.fetch_add(1);
+        DINGO_LOG(ERROR) << fmt::format(
+            "[vector_index.save][index_id({})][trace({})] Save vector index snapshot failed, error: {} {}",
+            vector_index_wrapper->Id(), trace, status.error_code(), status.error_str());
+        return status;
+      } else {
+        vector_index_wrapper->SetSnapshotLogId(snapshot_log_id);
+      }
+    } else {
+      if (save_vector_index_num.load() == 0) {
+        DINGO_LOG(INFO) << fmt::format(
+            "[vector_index.save][index_id({}_v{})][trace({})] FLAGS_cancel_save_vector_index_snapshot is true, skip "
+            "save.",
+            vector_index_wrapper->Id(), vector_index_wrapper->Version(), trace);
+      }
+    }
+
+    save_vector_index_num.fetch_add(1);
   }
 
   // Update vector index status NORMAL
