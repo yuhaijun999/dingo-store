@@ -19,6 +19,7 @@
 
 #include "butil/time.h"
 #include "client/client_helper.h"
+#include "client/client_interation.h"
 #include "client/coordinator_client_function.h"
 #include "common/helper.h"
 #include "common/logging.h"
@@ -171,8 +172,7 @@ void SendRaftAddPeer() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " request_attachment=" << cntl.request_attachment().size()
+    DINGO_LOG(INFO) << "Received response" << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
   }
@@ -222,8 +222,7 @@ void SendRaftRemovePeer() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " request_attachment=" << cntl.request_attachment().size()
+    DINGO_LOG(INFO) << "Received response" << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
   }
@@ -277,8 +276,7 @@ void SendRaftTransferLeader() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " request_attachment=" << cntl.request_attachment().size()
+    DINGO_LOG(INFO) << "Received response" << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
   }
@@ -320,8 +318,7 @@ void SendRaftSnapshot() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " request_attachment=" << cntl.request_attachment().size()
+    DINGO_LOG(INFO) << "Received response" << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
   }
@@ -385,8 +382,7 @@ void SendRaftResetPeer() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " request_attachment=" << cntl.request_attachment().size()
+    DINGO_LOG(INFO) << "Received response" << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
   }
@@ -422,8 +418,7 @@ void SendGetNodeInfo() {
   }
 
   if (FLAGS_log_each_request) {
-    DINGO_LOG(INFO) << "Received response"
-                    << " cluster_id=" << request.cluster_id()
+    DINGO_LOG(INFO) << "Received response" << " cluster_id=" << request.cluster_id()
                     << " request_attachment=" << cntl.request_attachment().size()
                     << " response_attachment=" << cntl.response_attachment().size() << " latency=" << cntl.latency_us();
     DINGO_LOG(INFO) << response.DebugString();
@@ -505,6 +500,82 @@ void SendChangeLogLevel() {
   DINGO_LOG(INFO) << request.DebugString();
   DINGO_LOG(INFO) << ::dingodb::pb::node::LogLevel_descriptor()->FindValueByNumber(request.log_level())->name();
   DINGO_LOG(INFO) << response.DebugString();
+}
+
+static butil::Status SetStoreInteraction(std::shared_ptr<dingodb::CoordinatorInteraction> coordinator_interaction,
+                                         std::shared_ptr<client::ServerInteraction>& store_interaction) {
+  dingodb::pb::coordinator::GetStoreMapRequest request;
+  dingodb::pb::coordinator::GetStoreMapResponse response;
+
+  request.mutable_request_info()->set_request_id(dingodb::Helper::GenerateRandomInteger(1, 1000000));
+  request.add_filter_store_types(::dingodb::pb::common::StoreType::NODE_TYPE_STORE);
+  butil::Status status = coordinator_interaction->SendRequest("GetStoreMap", request, response);
+  if (!status.ok()) {
+    std::string s = fmt::format("Fail to get store map, status={}", status.error_cstr());
+    DINGO_LOG(ERROR) << s;
+    return butil::Status(dingodb::pb::error::EINTERNAL, s);
+  }
+
+  std::vector<std::string> addrs;
+
+  for (int i = 0; i < response.storemap().stores_size(); i++) {
+    const dingodb::pb::common::Store& store = response.storemap().stores(i);
+    const auto& location = store.server_location();
+    DINGO_LOG(INFO) << "store_id=" << store.id() << ", host=" << location.host() << ",  " << location.port();
+    addrs.push_back(fmt::format("{}:{}", location.host(), location.port()));
+  }
+
+  store_interaction = std::make_shared<client::ServerInteraction>();
+  if (!store_interaction->Init(addrs)) {
+    std::string s = fmt::format("Fail to init store_interaction, addrs");
+    for (const auto& addr : addrs) {
+      s += fmt::format(" {}", addr);
+    }
+    DINGO_LOG(ERROR) << s;
+    return butil::Status(dingodb::pb::error::EINTERNAL, s);
+  }
+
+  return butil::Status();
+}
+
+void SendControlConfig(std::shared_ptr<dingodb::CoordinatorInteraction> coordinator_interaction,
+                       const std::string& role, const std::string& name, const std::string& value) {
+  if (role != "store") {
+    DINGO_LOG(ERROR) << "role must be store, but got " << role;
+    return;
+  }
+
+  if (name.empty() || value.empty()) {
+    DINGO_LOG(ERROR) << "name or value is empty";
+    return;
+  }
+
+  std::shared_ptr<client::ServerInteraction> store_interaction;
+
+  butil::Status status = SetStoreInteraction(coordinator_interaction, store_interaction);
+
+  dingodb::pb::store::ControlConfigRequest request;
+  dingodb::pb::store::ControlConfigResponse response;
+
+  dingodb::pb::common::ControlConfigVariable config;
+  config.set_name(std::string("FLAGS_") + name);
+  config.set_value(value);
+  request.mutable_control_config_variable()->Add(std::move(config));
+
+  request.mutable_request_info()->set_request_id(dingodb::Helper::GenerateRandomInteger(1, 1000000));
+
+  DINGO_LOG(INFO) << "ControlConfig Request : " << request.DebugString();
+
+  status = store_interaction->AllSendRequest("StoreService", "ControlConfig", request, response);
+  if (!status.ok()) {
+    DINGO_LOG(ERROR) << fmt::format("Fail to AllSendRequest, status={}", status.error_cstr());
+  }
+
+  if (response.error().errcode() != dingodb::pb::error::OK) {
+    DINGO_LOG(ERROR) << fmt::format("Fail to AllSendRequest, status={}", response.error().errmsg());
+  }
+
+  DINGO_LOG(INFO) << "ControlConfig Response : " << response.DebugString();
 }
 
 // coordinator service

@@ -49,6 +49,7 @@ namespace dingodb {
 
 DECLARE_bool(region_enable_auto_split);
 DECLARE_bool(region_enable_auto_merge);
+DECLARE_bool(enable_monitor_txn_scan_time_consumption);
 
 Storage::Storage(std::shared_ptr<Engine> raft_engine, std::shared_ptr<Engine> mono_engine,
                  mvcc::TsProviderPtr ts_provider)
@@ -1715,6 +1716,8 @@ butil::Status Storage::ControlConfig(std::shared_ptr<Context> /*ctx*/,
       Helper::HandleBoolControlConfigVariable(variable, config, FLAGS_region_enable_auto_split);
     } else if ("FLAGS_region_enable_auto_merge" == variable.name()) {
       Helper::HandleBoolControlConfigVariable(variable, config, FLAGS_region_enable_auto_merge);
+    } else if ("FLAGS_enable_monitor_txn_scan_time_consumption" == variable.name()) {
+      Helper::HandleBoolControlConfigVariable(variable, config, FLAGS_enable_monitor_txn_scan_time_consumption);
     } else {
       config.set_is_already_set(false);
       config.set_is_error_occurred(true);

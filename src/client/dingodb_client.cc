@@ -238,6 +238,8 @@ DEFINE_bool(delete_data_file, false, "diskann If true, delete data file after re
 DEFINE_bool(dump_all, false,
             "diskann If true, dump all vector id data from diskann. or just dump the data of this region.");
 
+DECLARE_string(role);
+
 bvar::LatencyRecorder g_latency_recorder("dingo-store");
 
 const std::map<std::string, std::vector<std::string>> kParamConstraint = {
@@ -736,6 +738,8 @@ int CoordinatorSender() {
     SendGetLogLevel();
   } else if (FLAGS_method == "ChangeLogLevel") {
     SendChangeLogLevel();
+  } else if (FLAGS_method == "ControlConfig") {
+    SendControlConfig(coordinator_interaction, FLAGS_role, FLAGS_name, FLAGS_value);
   } else if (FLAGS_method == "Hello") {
     SendHello(coordinator_interaction);
   } else if (FLAGS_method == "StoreHeartbeat") {

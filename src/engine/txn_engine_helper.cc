@@ -74,6 +74,8 @@ DEFINE_int64(max_restore_count, 100000, "max restore count");
 DECLARE_int64(stream_message_max_bytes);
 DECLARE_int64(stream_message_max_limit_size);
 
+DEFINE_bool(enable_monitor_txn_scan_time_consumption, false, "enable monitor txn scan time consumption");
+
 butil::Status TxnReader::Init() {
   if (is_initialized_) {
     return butil::Status::OK();
@@ -1248,6 +1250,178 @@ class TxnScanStreamState : public StreamState {
   TxnIteratorPtr iter;
 };
 
+class TxnScanTimeConsumption {
+ public:
+  struct OperatorDuration {
+    std::string name{"unknow"};
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point end_time;
+    int64_t duration{0};
+    int64_t count{0};
+
+    OperatorDuration(const std::string &name, const std::chrono::steady_clock::time_point &start_time)
+        : name(name), start_time(start_time), duration(0), count(1) {}
+
+    OperatorDuration(const OperatorDuration &other) = default;
+
+    OperatorDuration(OperatorDuration &&other) noexcept
+        : name(std::move(other.name)),
+          start_time(other.start_time),
+          end_time(other.end_time),
+          duration(other.duration),
+          count(other.count) {}
+
+    OperatorDuration &operator=(const OperatorDuration &other) {
+      if (this != &other) {
+        name = other.name;
+        start_time = other.start_time;
+        end_time = other.end_time;
+        duration = other.duration;
+        count = other.count;
+      }
+      return *this;
+    }
+
+    OperatorDuration &operator=(OperatorDuration &&other) noexcept {
+      if (this != &other) {
+        name = std::move(other.name);
+        start_time = other.start_time;
+        end_time = other.end_time;
+        duration = other.duration;
+        count = other.count;
+      }
+      return *this;
+    }
+  };
+
+  TxnScanTimeConsumption(StreamPtr stream, const pb::store::IsolationLevel &isolation_level, int64_t start_ts,
+                         const pb::common::Range &range, int64_t limit, bool key_only, bool is_reverse,
+                         const std::set<int64_t> &resolved_locks, bool disable_coprocessor,
+                         const pb::common::CoprocessorV2 &coprocessor, pb::store::TxnResultInfo &txn_result_info)
+      : stream_(stream),
+        isolation_level_(isolation_level),
+        start_ts_(start_ts),
+        range_(range),
+        limit_(limit),
+        key_only_(key_only),
+        is_reverse_(is_reverse),
+        resolved_locks_(resolved_locks),
+        disable_coprocessor_(disable_coprocessor),
+        coprocessor_(coprocessor),
+        txn_result_info_(txn_result_info) {
+    global_start_time_ = GetCurrentTime();
+  }
+
+  ~TxnScanTimeConsumption() {
+    global_end_time_ = GetCurrentTime();
+    global_duration_ =
+        std::chrono::duration_cast<std::chrono::microseconds>(global_end_time_ - global_start_time_).count();
+
+    format_string_ = fmt::format(
+        "[txn][{}] Scan start_ts: {} range: {} isolation_level: {} start_ts: {} limit: {} key_only: {} is_reverse: {} "
+        "resolved_locks size: {} disable_coprocessor: {} coprocessor: {} txn_result_info: {}.",
+        stream_->StreamId(), start_ts_, Helper::RangeToString(range_), pb::store::IsolationLevel_Name(isolation_level_),
+        start_ts_, limit_, key_only_, is_reverse_, resolved_locks_.size(), disable_coprocessor_,
+        coprocessor_.ShortDebugString(), txn_result_info_.ShortDebugString());
+
+    Output();
+  }
+
+  static std::chrono::steady_clock::time_point GetCurrentTime() { return std::chrono::steady_clock::now(); }
+
+  void Start(const std::string &op_name) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    auto iter = operator_durations_.find(op_name);
+    if (iter != operator_durations_.end()) {
+      iter->second.start_time = start_time;
+      iter->second.end_time = {};
+      iter->second.count++;
+    } else {
+      OperatorDuration op_duration(op_name, start_time);
+      operator_durations_.insert({op_name, std::move(op_duration)});
+    }
+  }
+
+  void Stop(const std::string &op_name) {
+    auto end_time = std::chrono::steady_clock::now();
+    auto iter = operator_durations_.find(op_name);
+    if (iter == operator_durations_.end()) {
+      DINGO_LOG(FATAL) << fmt::format("[txn][{}] Stop not found op_name: {}.", stream_->StreamId(), op_name);
+    } else {
+      iter->second.end_time = end_time;
+      iter->second.duration +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end_time - iter->second.start_time).count();
+      iter->second.start_time = {};
+      iter->second.end_time = {};
+    }
+  }
+
+  void FormatMap() {
+    std::vector<OperatorDuration> vt_operator_durations;
+    int64_t misc_duration = 0;
+    int64_t accumulative_duration = 0;
+    for (const auto &pair : operator_durations_) {
+      const auto &op_name = pair.first;
+      const auto &duration = pair.second;
+
+      vt_operator_durations.push_back(duration);
+
+      accumulative_duration += duration.duration;
+    }
+
+    misc_duration = global_duration_ - accumulative_duration;
+
+    OperatorDuration misc_duration_op("misc", GetCurrentTime());
+    misc_duration_op.duration = misc_duration;
+    misc_duration_op.count = 1;
+
+    vt_operator_durations.push_back(misc_duration_op);
+
+    OperatorDuration global_duration_op("global", GetCurrentTime());
+    global_duration_op.duration = global_duration_;
+    global_duration_op.count = 1;
+
+    vt_operator_durations.push_back(global_duration_op);
+
+    // Sort by duration descending
+    std::sort(vt_operator_durations.begin(), vt_operator_durations.end(),
+              [](const OperatorDuration &a, const OperatorDuration &b) { return a.duration > b.duration; });
+
+    // Format the output string
+    for (const auto &op_duration : vt_operator_durations) {
+      format_string_ += fmt::format("\nOperator: {:<40}  duration: {:<20} us count: {:<10}", op_duration.name,
+                                    op_duration.duration, op_duration.count);
+    }
+
+    format_string_ += fmt::format("\n\n");
+  }
+
+  void Output() {
+    FormatMap();
+    DINGO_LOG(WARNING) << format_string_;
+  }
+
+ private:
+  std::chrono::steady_clock::time_point global_start_time_;
+  std::chrono::steady_clock::time_point global_end_time_;
+  int64_t global_duration_ = 0;
+  std::map<std::string, OperatorDuration> operator_durations_;
+  std::string format_string_;
+
+  StreamPtr stream_;
+  pb::store::IsolationLevel isolation_level_;
+  int64_t start_ts_;
+  pb::common::Range range_;
+  int64_t limit_;
+  bool key_only_;
+  bool is_reverse_;
+  std::set<int64_t> resolved_locks_;
+  bool disable_coprocessor_;
+  pb::common::CoprocessorV2 coprocessor_;
+  pb::store::TxnResultInfo txn_result_info_;
+};
+
 butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
                                     const pb::store::IsolationLevel &isolation_level, int64_t start_ts,
                                     const pb::common::Range &range, int64_t limit, bool key_only, bool is_reverse,
@@ -1256,6 +1430,12 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
                                     pb::store::TxnResultInfo &txn_result_info, std::vector<pb::common::KeyValue> &kvs,
                                     bool &has_more, std::string &end_scan_key) {
   BvarLatencyGuard bvar_guard(&g_txn_scan_latency);
+  std::shared_ptr<TxnScanTimeConsumption> scan_time_consumption;
+  if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+    scan_time_consumption =
+        std::make_shared<TxnScanTimeConsumption>(stream, isolation_level, start_ts, range, limit, key_only, is_reverse,
+                                                 resolved_locks, disable_coprocessor, coprocessor, txn_result_info);
+  }
 
   DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail) << fmt::format(
       "[txn][{}] Scan start_ts: {} range: {} isolation_level: {} start_ts: {} limit: {} key_only: {} is_reverse: {} "
@@ -1278,10 +1458,26 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
   auto stream_state =
       std::dynamic_pointer_cast<TxnScanStreamState>(stream->GetOrNewStreamState([&]() -> StreamStatePtr {
         auto iter = std::make_shared<TxnIterator>(raw_engine, range, start_ts, isolation_level, resolved_locks);
+        if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+          scan_time_consumption->Start("TxnIterator::Init");
+        }
         auto ret = iter->Init();
+
+        if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+          scan_time_consumption->Stop("TxnIterator::Init");
+        }
+
         CHECK(ret.ok()) << fmt::format("[txn][{}] Scan init txn_iter failed, start_ts: {} range: {}  status: {}.",
                                        stream->StreamId(), start_ts, Helper::RangeToString(range), ret.error_str());
+
+        if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+          scan_time_consumption->Start("TxnIterator::Seek");
+        }
         iter->Seek(range.start_key());
+        if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+          scan_time_consumption->Stop("TxnIterator::Seek");
+        }
+
         return TxnScanStreamState::New(iter);
       }));
   TxnIteratorPtr iter = stream_state->iter;
@@ -1312,14 +1508,47 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
 
   } else {
     size_t bytes = 0;
-    while (iter->Valid(txn_result_info)) {
+    while (true) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Start("TxnIterator::Valid");
+      }
+      auto valid = iter->Valid(txn_result_info);
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Stop("TxnIterator::Valid");
+      }
+
+      if (!valid) {
+        break;
+      }
+
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Start("TxnIterator::Key");
+      }
       auto key = iter->Key();
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Stop("TxnIterator::Key");
+      }
+
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Start("TxnIterator::Value");
+      }
       auto value = iter->Value();
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Stop("TxnIterator::Value");
+      }
 
       pb::common::KeyValue kv;
       kv.set_key(key);
       if (!key_only) kv.set_value(value);
+
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Start("pb::common::KeyValue::ByteSizeLong");
+      }
       bytes += kv.ByteSizeLong();
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Stop("pb::common::KeyValue::ByteSizeLong");
+      }
+
       kvs.push_back(std::move(kv));
 
       if (stop_checker(kvs.size(), bytes)) {
@@ -1334,13 +1563,25 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
         break;
       }
 
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Start("TxnIterator::Next");
+      }
       iter->Next();
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        scan_time_consumption->Stop("TxnIterator::Next");
+      }
     }
   }
 
+  if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+    scan_time_consumption->Start("TxnIterator::Valid::Key::Next");
+  }
   if (iter->Valid(txn_result_info)) {
     end_scan_key = iter->Key();
     iter->Next();
+  }
+  if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
+    scan_time_consumption->Stop("TxnIterator::Valid::Key::Next");
   }
 
   return butil::Status::OK();

@@ -27,6 +27,8 @@
 // node service functions
 void SendGetNodeInfo();
 void SendGetLogLevel();
+void SendControlConfig(std::shared_ptr<dingodb::CoordinatorInteraction> coordinator_interaction,
+                       const std::string& role, const std::string& name, const std::string& value);
 void SendChangeLogLevel();
 
 // raft_control functions
