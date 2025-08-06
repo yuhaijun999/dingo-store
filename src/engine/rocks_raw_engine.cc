@@ -832,6 +832,15 @@ bool CastValue(std::string value, std::string& dst_value) {
   return true;
 }
 
+static inline std::shared_ptr<rocksdb::Cache> NewHyperClockCache(
+    size_t capacity, size_t estimated_entry_charge, int num_shard_bits = -1, bool strict_capacity_limit = false,
+    std::shared_ptr<rocksdb::MemoryAllocator> memory_allocator = nullptr,
+    rocksdb::CacheMetadataChargePolicy metadata_charge_policy = rocksdb::kDefaultCacheMetadataChargePolicy) {
+  return rocksdb::HyperClockCacheOptions(capacity, estimated_entry_charge, num_shard_bits, strict_capacity_limit,
+                                         memory_allocator, metadata_charge_policy)
+      .MakeSharedCache();
+}
+
 // set cf config
 static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnFamilyPtr column_family) {
   rocksdb::ColumnFamilyOptions family_options;
@@ -846,6 +855,9 @@ static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnF
     CastValue(column_family->GetConfItem(Constant::kBlockCache), option_value);
 
     table_options.block_cache = rocksdb::NewLRUCache(option_value);  // LRUcache
+
+    // table_options.block_cache = NewHyperClockCache(option_value, 0);  // HyperClockCache // No improvement compared
+    // to LRUCache
   }
 
   // arena_block_size
@@ -889,8 +901,12 @@ static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnF
       rocksdb::CompressionType::kZSTD,
   };
 
-  table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10.0, false));
+  table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10.0, false));  // 10.0 to 15.0  No improvement
   table_options.whole_key_filtering = true;
+
+  // table_options.cache_index_and_filter_blocks = true;                      // No improvement
+  // table_options.pin_l0_filter_and_index_blocks_in_cache = true;            // No improvement
+  // table_options.cache_index_and_filter_blocks_with_high_priority = true;   // No improvement
 
   rocksdb::TableFactory* table_factory = NewBlockBasedTableFactory(table_options);
   family_options.table_factory.reset(table_factory);
@@ -914,7 +930,7 @@ rocksdb::DB* RocksRawEngine::InitDB(const std::string& db_path, rocks::ColumnFam
   db_options.max_subcompactions = db_options.max_background_jobs / 4 * 3;
   db_options.stats_dump_period_sec = ConfigHelper::GetRocksDBStatsDumpPeriodSec();
   db_options.use_direct_io_for_flush_and_compaction = true;
-  db_options.statistics=rocksdb::CreateDBStatistics();
+  db_options.statistics = rocksdb::CreateDBStatistics();
 
   DINGO_LOG(INFO) << fmt::format("[rocksdb] config max_background_jobs({}) max_subcompactions({})",
                                  db_options.max_background_jobs, db_options.max_subcompactions);
