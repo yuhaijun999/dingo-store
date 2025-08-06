@@ -76,6 +76,178 @@ DECLARE_int64(stream_message_max_limit_size);
 
 DEFINE_bool(enable_monitor_txn_scan_time_consumption, false, "enable monitor txn scan time consumption");
 
+class TxnScanTimeConsumption {
+ public:
+  struct OperatorDuration {
+    std::string name{"unknow"};
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point end_time;
+    int64_t duration{0};
+    int64_t count{0};
+
+    OperatorDuration(const std::string &name, const std::chrono::steady_clock::time_point &start_time)
+        : name(name), start_time(start_time), duration(0), count(1) {}
+
+    OperatorDuration(const OperatorDuration &other) = default;
+
+    OperatorDuration(OperatorDuration &&other) noexcept
+        : name(std::move(other.name)),
+          start_time(other.start_time),
+          end_time(other.end_time),
+          duration(other.duration),
+          count(other.count) {}
+
+    OperatorDuration &operator=(const OperatorDuration &other) {
+      if (this != &other) {
+        name = other.name;
+        start_time = other.start_time;
+        end_time = other.end_time;
+        duration = other.duration;
+        count = other.count;
+      }
+      return *this;
+    }
+
+    OperatorDuration &operator=(OperatorDuration &&other) noexcept {
+      if (this != &other) {
+        name = std::move(other.name);
+        start_time = other.start_time;
+        end_time = other.end_time;
+        duration = other.duration;
+        count = other.count;
+      }
+      return *this;
+    }
+  };
+
+  TxnScanTimeConsumption(StreamPtr stream, const pb::store::IsolationLevel &isolation_level, int64_t start_ts,
+                         const pb::common::Range &range, int64_t limit, bool key_only, bool is_reverse,
+                         const std::set<int64_t> &resolved_locks, bool disable_coprocessor,
+                         const pb::common::CoprocessorV2 &coprocessor, pb::store::TxnResultInfo &txn_result_info)
+      : stream_(stream),
+        isolation_level_(isolation_level),
+        start_ts_(start_ts),
+        range_(range),
+        limit_(limit),
+        key_only_(key_only),
+        is_reverse_(is_reverse),
+        resolved_locks_(resolved_locks),
+        disable_coprocessor_(disable_coprocessor),
+        coprocessor_(coprocessor),
+        txn_result_info_(txn_result_info) {
+    global_start_time_ = GetCurrentTime();
+  }
+
+  ~TxnScanTimeConsumption() {
+    global_end_time_ = GetCurrentTime();
+    global_duration_ =
+        std::chrono::duration_cast<std::chrono::microseconds>(global_end_time_ - global_start_time_).count();
+
+    format_string_ = fmt::format(
+        "[txn][{}] Scan start_ts: {} range: {} isolation_level: {} start_ts: {} limit: {} key_only: {} is_reverse: {} "
+        "resolved_locks size: {} disable_coprocessor: {} coprocessor: {} txn_result_info: {}.",
+        stream_->StreamId(), start_ts_, Helper::RangeToString(range_), pb::store::IsolationLevel_Name(isolation_level_),
+        start_ts_, limit_, key_only_, is_reverse_, resolved_locks_.size(), disable_coprocessor_,
+        coprocessor_.ShortDebugString(), txn_result_info_.ShortDebugString());
+
+    Output();
+  }
+
+  static std::chrono::steady_clock::time_point GetCurrentTime() { return std::chrono::steady_clock::now(); }
+
+  void Start(const std::string &op_name) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    auto iter = operator_durations_.find(op_name);
+    if (iter != operator_durations_.end()) {
+      iter->second.start_time = start_time;
+      iter->second.end_time = {};
+      iter->second.count++;
+    } else {
+      OperatorDuration op_duration(op_name, start_time);
+      operator_durations_.insert({op_name, std::move(op_duration)});
+    }
+  }
+
+  void Stop(const std::string &op_name) {
+    auto end_time = std::chrono::steady_clock::now();
+    auto iter = operator_durations_.find(op_name);
+    if (iter == operator_durations_.end()) {
+      DINGO_LOG(FATAL) << fmt::format("[txn][{}] Stop not found op_name: {}.", stream_->StreamId(), op_name);
+    } else {
+      iter->second.end_time = end_time;
+      iter->second.duration +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end_time - iter->second.start_time).count();
+      iter->second.start_time = {};
+      iter->second.end_time = {};
+    }
+  }
+
+  void FormatMap() {
+    std::vector<OperatorDuration> vt_operator_durations;
+    int64_t misc_duration = 0;
+    int64_t accumulative_duration = 0;
+    for (const auto &pair : operator_durations_) {
+      const auto &op_name = pair.first;
+      const auto &duration = pair.second;
+
+      vt_operator_durations.push_back(duration);
+
+      accumulative_duration += duration.duration;
+    }
+
+    misc_duration = global_duration_ - accumulative_duration;
+
+    OperatorDuration misc_duration_op("misc", GetCurrentTime());
+    misc_duration_op.duration = misc_duration;
+    misc_duration_op.count = 1;
+
+    vt_operator_durations.push_back(misc_duration_op);
+
+    OperatorDuration global_duration_op("global", GetCurrentTime());
+    global_duration_op.duration = global_duration_;
+    global_duration_op.count = 1;
+
+    vt_operator_durations.push_back(global_duration_op);
+
+    // Sort by duration descending
+    std::sort(vt_operator_durations.begin(), vt_operator_durations.end(),
+              [](const OperatorDuration &a, const OperatorDuration &b) { return a.duration > b.duration; });
+
+    // Format the output string
+    for (const auto &op_duration : vt_operator_durations) {
+      format_string_ += fmt::format("\nOperator: {:<50}  duration: {:<10} us count: {:<10}", op_duration.name,
+                                    op_duration.duration, op_duration.count);
+    }
+
+    format_string_ += fmt::format("\n\n");
+  }
+
+  void Output() {
+    FormatMap();
+    DINGO_LOG(WARNING) << format_string_;
+  }
+
+ private:
+  std::chrono::steady_clock::time_point global_start_time_;
+  std::chrono::steady_clock::time_point global_end_time_;
+  int64_t global_duration_ = 0;
+  std::map<std::string, OperatorDuration> operator_durations_;
+  std::string format_string_;
+
+  StreamPtr stream_;
+  pb::store::IsolationLevel isolation_level_;
+  int64_t start_ts_;
+  pb::common::Range range_;
+  int64_t limit_;
+  bool key_only_;
+  bool is_reverse_;
+  std::set<int64_t> resolved_locks_;
+  bool disable_coprocessor_;
+  pb::common::CoprocessorV2 coprocessor_;
+  pb::store::TxnResultInfo txn_result_info_;
+};
+
 butil::Status TxnReader::Init() {
   if (is_initialized_) {
     return butil::Status::OK();
@@ -539,6 +711,47 @@ butil::Status TxnIterator::Next() {
   return ret;
 }
 
+butil::Status TxnIterator::Next(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption) {
+  butil::Status ret;
+
+  while (ret.ok()) {
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Start("TxnIterator::Next::InnerNext");
+      }
+    }
+
+    ret = InnerNext(txn_scan_time_consumption);
+
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Stop("TxnIterator::Next::InnerNext");
+      }
+    }
+
+    if (ret.error_code() == pb::error::Errno::ETXN_SCAN_FINISH) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]InnerNext stopped, errcode: " << ret.error_code() << ", errmsg: " << ret.error_str();
+      return butil::Status::OK();
+    } else if (!ret.ok()) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]InnerNext stopped, errcode: " << ret.error_code() << ", errmsg: " << ret.error_str();
+      return ret;
+    }
+
+    if (!value_.empty()) {
+      return butil::Status::OK();
+    } else {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]InnerNext value is empty, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
+          << ", key_: " << Helper::StringToHex(key_);
+      continue;
+    }
+  }
+
+  return ret;
+}
+
 butil::Status TxnIterator::InnerNext() {
   if (key_.empty()) {
     DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
@@ -640,10 +853,167 @@ butil::Status TxnIterator::InnerNext() {
   }
 }
 
+butil::Status TxnIterator::InnerNext(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption) {
+  if (key_.empty()) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+        << "[txn]Scan Next key_ is empty, scan is finished, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
+    return butil::Status(pb::error::Errno::ETXN_SCAN_FINISH, "key_ is empty");
+  }
+
+  if (txn_result_info_.ByteSizeLong() > 0) {
+    DINGO_LOG(ERROR) << "[txn]Scan Next txn_result_info_ is not empty, start_ts: " << start_ts_
+                     << ", seek_ts: " << seek_ts_;
+    return butil::Status(pb::error::Errno::ETXN_RESULT_INFO_NOT_NULL, "key_ is empty");
+  }
+
+  value_.clear();
+
+  if (lock_iter_->Valid() && key_ >= last_lock_key_) {
+    while (lock_iter_->Valid()) {
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Start("TxnIterator::Next::Lock::Next");
+        }
+      }
+      lock_iter_->Next();
+
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Stop("TxnIterator::Next::Lock::Next");
+        }
+      }
+
+      int64_t lock_ts = 0;
+      if (lock_iter_->Valid()) {
+        auto ret = mvcc::Codec::DecodeKey(lock_iter_->Key(), last_lock_key_, lock_ts);
+        if (!ret) {
+          DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, lock_iter->key: "
+                           << Helper::StringToHex(lock_iter_->Key()) << ", start_ts: " << start_ts_
+                           << ", seek_ts: " << seek_ts_;
+        }
+        if (last_lock_key_ > key_) {
+          DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+              << "[txn]Scan last_lock_key_ > key_, find next key, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
+              << ", last_lock_key: " << Helper::StringToHex(last_lock_key_) << ", key_: " << Helper::StringToHex(key_);
+          break;
+        }
+      } else {
+        DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+            << "[txn]Scan lock_iter is invalid, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
+            << ", last_lock_key: " << Helper::StringToHex(last_lock_key_) << ", will set last_lock_key to empty";
+        last_lock_key_ = std::string();
+      }
+    }
+  }
+
+  if (key_ >= last_write_key_ && write_iter_->Valid()) {
+    DINGO_LOG(FATAL) << "[txn]Scan write_iter is valid, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
+                     << ", last_write_key: " << Helper::StringToHex(last_write_key_);
+  }
+  // // CAUTION: we do writer_iter_->Next() in GetCurrentValue(), so we don't need to do writer_iter_->Next() here
+  // int64_t write_ts = 0;
+  // if (write_iter_->Valid()) {
+  //   auto ret = mvcc::Codec::DecodeKey(write_iter_->Key(), last_write_key_, write_ts);
+  //   if (!ret) {
+  //     DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, write_iter->key: "
+  //                      << Helper::StringToHex(write_iter_->Key()) << ", start_ts: " << start_ts_
+  //                      << ", seek_ts: " << seek_ts_;
+  //   }
+  //   CHECK(last_write_key_ > key_);
+  // } else {
+  //   DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail) << "[txn]Scan write_iter is invalid, start_ts: " <<
+  //   start_ts_ << ", seek_ts: " << seek_ts_
+  //                   << ", last_write_key: " << Helper::StringToHex(last_write_key_);
+  // }
+
+  if (last_lock_key_.empty() && last_write_key_.empty()) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+        << "[txn]Scan last_lock_key_ and last_write_key_ are empty, start_ts: " << start_ts_
+        << ", seek_ts: " << seek_ts_ << ", key_: " << Helper::StringToHex(key_);
+
+    if (!lock_iter_->Valid() && !write_iter_->Valid()) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan lock_iter_ and write_iter_ are invalid, the iterator is finished, start_ts: " << start_ts_
+          << ", seek_ts: " << seek_ts_ << ", key_: " << Helper::StringToHex(key_);
+      key_.clear();
+      return butil::Status::OK();
+    }
+
+    return butil::Status::OK();
+  }
+
+  if (last_lock_key_ <= key_ && last_write_key_ <= key_) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+        << "[txn]Scan last_lock_key_ <= key_ && last_write_key_ <= key_, no key found, start_ts: " << start_ts_
+        << ", seek_ts: " << seek_ts_ << ", last_lock_key: " << Helper::StringToHex(last_lock_key_)
+        << ", last_write_key: " << Helper::StringToHex(last_write_key_) << ", key_: " << Helper::StringToHex(key_);
+    key_.clear();
+    return butil::Status::OK();
+  }
+
+  if (txn_scan_time_consumption) {
+    if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+      txn_scan_time_consumption->Start("TxnIterator::Next::GetCurrentValue");
+    }
+  }
+  auto ret = GetCurrentValue(txn_scan_time_consumption);
+  if (txn_scan_time_consumption) {
+    if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+      txn_scan_time_consumption->Stop("TxnIterator::Next::GetCurrentValue");
+    }
+  }
+
+  if (ret.ok()) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+        << "[txn]GetCurrentValue OK, key_: " << Helper::StringToHex(key_) << ", value_: " << Helper::StringToHex(value_)
+        << ", start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
+    return butil::Status::OK();
+  } else if (ret.error_code() == pb::error::Errno::ETXN_LOCK_CONFLICT) {
+    DINGO_LOG(INFO) << "[txn]GetCurrentValue failed, errcode: " << ret.error_code() << ", errmsg: " << ret.error_str();
+    return ret;
+  } else {
+    DINGO_LOG(ERROR) << "[txn]GetCurrentValue failed, errcode: " << ret.error_code() << ", errmsg: " << ret.error_str();
+    return ret;
+  }
+}
+
 butil::Status TxnIterator::GotoNextUserKeyInWriteIter(std::shared_ptr<Iterator> write_iter, std::string prev_user_key,
                                                       std::string &last_write_key) {
   while (write_iter->Valid()) {
     write_iter->Next();
+    if (write_iter->Valid()) {
+      int64_t commit_ts;
+      auto ret = mvcc::Codec::DecodeKey(write_iter->Key(), last_write_key, commit_ts);
+      if (!ret) {
+        DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, write_iter->key: "
+                         << Helper::StringToHex(write_iter->Key());
+      }
+
+      if (last_write_key > prev_user_key) {
+        break;
+      }
+    }
+  }
+
+  return butil::Status::OK();
+}
+
+butil::Status TxnIterator::GotoNextUserKeyInWriteIter(
+    std::shared_ptr<Iterator> write_iter, std::string prev_user_key, std::string &last_write_key,
+    const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption) {
+  while (write_iter->Valid()) {
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Start("TxnIterator::Next::Write::Next");
+      }
+    }
+    write_iter->Next();
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Stop("TxnIterator::Next::Write::Next");
+      }
+    }
+
     if (write_iter->Valid()) {
       int64_t commit_ts;
       auto ret = mvcc::Codec::DecodeKey(write_iter->Key(), last_write_key, commit_ts);
@@ -784,6 +1154,198 @@ butil::Status TxnIterator::GetUserValueInWriteIter(std::shared_ptr<Iterator> wri
   return butil::Status::OK();
 }
 
+butil::Status TxnIterator::GetUserValueInWriteIter(
+    std::shared_ptr<Iterator> write_iter, RawEngine::ReaderPtr reader, pb::store::IsolationLevel isolation_level,
+    int64_t seek_ts, int64_t start_ts, const std::string &user_key, std::string &last_write_key, bool &is_value_found,
+    std::string &user_value, const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption) {
+  is_value_found = false;
+  while (write_iter->Valid()) {
+    int64_t commit_ts;
+    auto ret1 = mvcc::Codec::DecodeKey(write_iter->Key(), last_write_key, commit_ts);
+    if (!ret1) {
+      DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, write_iter->key: " << Helper::StringToHex(write_iter->Key())
+                       << ", start_ts: " << start_ts << ", seek_ts: " << seek_ts;
+    }
+
+    if (last_write_key > user_key) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan last_write_key > user_key, means no value, start_ts: " << start_ts << ", seek_ts: " << seek_ts
+          << ", last_write_key: " << Helper::StringToHex(last_write_key)
+          << ", user_key: " << Helper::StringToHex(user_key);
+      return butil::Status::OK();
+    }
+
+    // check isolation_level
+    if (isolation_level == pb::store::IsolationLevel::SnapshotIsolation) {
+      if (commit_ts > start_ts) {
+        DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+            << "[txn]Scan commit_ts > start_ts, means this value is not accepted, will go to next, start_ts: "
+            << start_ts << ", commit_ts: " << commit_ts << ", user_key: " << Helper::StringToHex(user_key);
+
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Start("TxnIterator::Next::Write::Next");
+          }
+        }
+        write_iter->Next();
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Stop("TxnIterator::Next::Write::Next");
+          }
+        }
+
+        // we need to setup is_value_found to true, so that the caller can go to next user_key
+        // is_value_found means the value is found, not means the value is valid
+        // the user_value is not valid, so we need to go to next user_key
+        is_value_found = true;
+        user_value = std::string();
+        continue;
+      }
+    } else if (isolation_level == pb::store::IsolationLevel::ReadCommitted) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan RC, commit_ts: " << commit_ts << ", start_ts: " << start_ts << ", seek_ts: " << seek_ts
+          << ", user_key: " << Helper::StringToHex(user_key);
+    } else {
+      DINGO_LOG(ERROR) << "[txn]BatchGet invalid isolation_level: " << isolation_level;
+      return butil::Status(pb::error::Errno::EILLEGAL_PARAMTETERS, "invalid isolation_level");
+    }
+
+    pb::store::WriteInfo write_info;
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Start("TxnIterator::Next::WRITE_INFO::ParseFromArray");
+      }
+    }
+    auto ret2 = write_info.ParseFromArray(write_iter->Value().data(), write_iter->Value().size());
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Stop("TxnIterator::Next::WRITE_INFO::ParseFromArray");
+      }
+    }
+
+    if (!ret2) {
+      DINGO_LOG(FATAL) << "[txn]Scan parse write info failed, write_key: " << Helper::StringToHex(write_iter->Key())
+                       << ", write_value(hex): " << Helper::StringToHex(write_iter->Value());
+    }
+
+    if (write_info.op() == pb::store::Op::Delete) {
+      // if op is delete, value is null
+      user_value = std::string();
+
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Start("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+        }
+      }
+      // before return, go to next user_key
+      GotoNextUserKeyInWriteIter(write_iter, last_write_key, last_write_key, txn_scan_time_consumption);
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Stop("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+        }
+      }
+      is_value_found = true;
+      return butil::Status::OK();
+    } else if (write_info.op() == pb::store::Op::Rollback) {
+      // if op is rollback, go to next write
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Start("TxnIterator::Next::Write::Next");
+        }
+      }
+      write_iter->Next();
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Stop("TxnIterator::Next::Write::Next");
+        }
+      }
+
+      // we need to setup is_value_found to true, so that the caller can go to next user_key
+      // is_value_found means the value is found, not means the value is valid
+      // the user_value is not valid, so we need to go to next user_key
+      is_value_found = true;
+      user_value = std::string();
+    } else if (write_info.op() == pb::store::Op::Put) {
+      // use write_ts to get data from data_cf
+      if (!write_info.short_value().empty()) {
+        user_value = write_info.short_value();
+
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Start("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+          }
+        }
+        // before return, go to next user_key
+        GotoNextUserKeyInWriteIter(write_iter, last_write_key, last_write_key, txn_scan_time_consumption);
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Stop("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+          }
+        }
+        is_value_found = true;
+        return butil::Status::OK();
+      } else {
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Start("TxnIterator::Next::Data::Value");
+          }
+        }
+        auto ret3 =
+            reader->KvGet(Constant::kTxnDataCF, mvcc::Codec::EncodeKey(user_key, write_info.start_ts()), user_value);
+        if (txn_scan_time_consumption) {
+          if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+            txn_scan_time_consumption->Stop("TxnIterator::Next::Data::Value");
+          }
+        }
+
+        if (!ret3.ok() && ret3.error_code() != pb::error::Errno::EKEY_NOT_FOUND) {
+          DINGO_LOG(FATAL) << "[txn]Scan read data failed, key: " << Helper::StringToHex(user_key)
+                           << ", status: " << ret3.error_str();
+          return butil::Status(pb::error::Errno::EINTERNAL, "read data failed");
+        } else if (ret3.error_code() == pb::error::Errno::EKEY_NOT_FOUND) {
+          DINGO_LOG(ERROR) << "[txn]Scan read data failed, data is illegally not found, key: "
+                           << Helper::StringToHex(user_key) << ", status: " << ret3.error_str()
+                           << ", ts: " << write_info.start_ts();
+          return butil::Status(pb::error::Errno::EINTERNAL, "data is illegally not found");
+        } else {
+          // before return, go to next user_key
+          if (txn_scan_time_consumption) {
+            if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+              txn_scan_time_consumption->Start("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+            }
+          }
+          GotoNextUserKeyInWriteIter(write_iter, last_write_key, last_write_key, txn_scan_time_consumption);
+          if (txn_scan_time_consumption) {
+            if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+              txn_scan_time_consumption->Stop("TxnIterator::Next::GotoNextUserKeyInWriteIter");
+            }
+          }
+          is_value_found = true;
+          return ret3;
+        }
+      }
+    } else {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan write_iter meet illegal op, start_ts: " << start_ts << ", seek_ts: " << seek_ts
+          << ", last_write_key: " << Helper::StringToHex(last_write_key)
+          << ", tmp_key: " << Helper::StringToHex(user_key) << ", write_info.op: " << write_info.op();
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Start("TxnIterator::Next::Write::Next");
+        }
+      }
+      write_iter->Next();
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Stop("TxnIterator::Next::Write::Next");
+        }
+      }
+    }
+  }
+
+  return butil::Status::OK();
+}
+
 butil::Status TxnIterator::GetCurrentValue() {
   bool check_lock_cf_first = false;
 
@@ -861,6 +1423,116 @@ butil::Status TxnIterator::GetCurrentValue() {
   return butil::Status::OK();
 }
 
+butil::Status TxnIterator::GetCurrentValue(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption) {
+  bool check_lock_cf_first = false;
+
+  CHECK(!(last_write_key_.empty() && last_lock_key_.empty()));
+
+  if (last_write_key_.empty()) {
+    check_lock_cf_first = true;
+  } else if (!last_lock_key_.empty()) {
+    if (last_lock_key_ <= last_write_key_) {
+      check_lock_cf_first = true;
+    } else if (!write_iter_->Valid()) {
+      check_lock_cf_first = true;
+    }
+  }
+
+  if (check_lock_cf_first) {
+    key_ = last_lock_key_;
+
+    // get lock info
+    pb::store::LockInfo lock_info;
+    auto lock_value = lock_iter_->Value();
+
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Start("TxnIterator::Next::LOCK_INFO::ParseFromArray");
+      }
+    }
+    auto ret1 = lock_info.ParseFromArray(lock_value.data(), lock_value.size());
+
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Stop("TxnIterator::Next::LOCK_INFO::ParseFromArray");
+      }
+    }
+
+    if (!ret1) {
+      DINGO_LOG(FATAL) << "[txn]Scan parse lock info failed, lock_key: " << Helper::StringToHex(lock_iter_->Key())
+                       << ", lock_value(hex): " << Helper::StringToHex(lock_value);
+    }
+
+    auto is_lock_conflict =
+        TxnEngineHelper::CheckLockConflict(lock_info, isolation_level_, start_ts_, resolved_locks_, txn_result_info_);
+    if (is_lock_conflict) {
+      DINGO_LOG(WARNING) << "[txn]Scan CheckLockConflict return conflict, key: " << Helper::StringToHex(lock_info.key())
+                         << ", isolation_level: " << isolation_level_ << ", start_ts: " << start_ts_
+                         << ", seek_ts: " << seek_ts_ << ", lock_info: " << lock_info.ShortDebugString()
+                         << ", txn_result_info: " << txn_result_info_.ShortDebugString();
+      key_.clear();
+      value_.clear();
+      return butil::Status(pb::error::Errno::ETXN_LOCK_CONFLICT, "lock conflict");
+    }
+
+    // if lock_key == write_key, then we can get data from write_cf
+    if (last_lock_key_ == last_write_key_) {
+      bool is_value_found = false;
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Start("TxnIterator::Next::GetUserValueInWriteIter");
+        }
+      }
+      GetUserValueInWriteIter(write_iter_, reader_, isolation_level_, seek_ts_, start_ts_, key_, last_write_key_,
+                              is_value_found, value_, txn_scan_time_consumption);
+
+      if (txn_scan_time_consumption) {
+        if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+          txn_scan_time_consumption->Stop("TxnIterator::Next::GetUserValueInWriteIter");
+        }
+      }
+
+      if (is_value_found) {
+        return butil::Status::OK();
+      } else {
+        // no valid value is found, so the txn iterator will be invalid
+        // clear the key_ to make the txn iterator invalid
+        key_.clear();
+        return butil::Status::OK();
+      }
+    } else {
+      // lock_key < write_key, there is no data
+      return butil::Status::OK();
+    }
+  } else {
+    key_ = last_write_key_;
+
+    bool is_value_found = false;
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Start("TxnIterator::Next::GetUserValueInWriteIter");
+      }
+    }
+    GetUserValueInWriteIter(write_iter_, reader_, isolation_level_, seek_ts_, start_ts_, key_, last_write_key_,
+                            is_value_found, value_, txn_scan_time_consumption);
+    if (txn_scan_time_consumption) {
+      if (FLAGS_enable_monitor_txn_scan_time_consumption) {
+        txn_scan_time_consumption->Stop("TxnIterator::Next::GetUserValueInWriteIter");
+      }
+    }
+
+    if (is_value_found) {
+      return butil::Status::OK();
+    } else {
+      // no valid value is found, so the txn iterator will be invalid
+      // clear the key_ to make the txn iterator invalid
+      key_.clear();
+      return butil::Status::OK();
+    }
+  }
+
+  return butil::Status::OK();
+}
 bool TxnIterator::Valid(pb::store::TxnResultInfo &txn_result_info) {
   if (txn_result_info_.ByteSizeLong() > 0) {
     txn_result_info = txn_result_info_;
@@ -1250,178 +1922,6 @@ class TxnScanStreamState : public StreamState {
   TxnIteratorPtr iter;
 };
 
-class TxnScanTimeConsumption {
- public:
-  struct OperatorDuration {
-    std::string name{"unknow"};
-    std::chrono::steady_clock::time_point start_time;
-    std::chrono::steady_clock::time_point end_time;
-    int64_t duration{0};
-    int64_t count{0};
-
-    OperatorDuration(const std::string &name, const std::chrono::steady_clock::time_point &start_time)
-        : name(name), start_time(start_time), duration(0), count(1) {}
-
-    OperatorDuration(const OperatorDuration &other) = default;
-
-    OperatorDuration(OperatorDuration &&other) noexcept
-        : name(std::move(other.name)),
-          start_time(other.start_time),
-          end_time(other.end_time),
-          duration(other.duration),
-          count(other.count) {}
-
-    OperatorDuration &operator=(const OperatorDuration &other) {
-      if (this != &other) {
-        name = other.name;
-        start_time = other.start_time;
-        end_time = other.end_time;
-        duration = other.duration;
-        count = other.count;
-      }
-      return *this;
-    }
-
-    OperatorDuration &operator=(OperatorDuration &&other) noexcept {
-      if (this != &other) {
-        name = std::move(other.name);
-        start_time = other.start_time;
-        end_time = other.end_time;
-        duration = other.duration;
-        count = other.count;
-      }
-      return *this;
-    }
-  };
-
-  TxnScanTimeConsumption(StreamPtr stream, const pb::store::IsolationLevel &isolation_level, int64_t start_ts,
-                         const pb::common::Range &range, int64_t limit, bool key_only, bool is_reverse,
-                         const std::set<int64_t> &resolved_locks, bool disable_coprocessor,
-                         const pb::common::CoprocessorV2 &coprocessor, pb::store::TxnResultInfo &txn_result_info)
-      : stream_(stream),
-        isolation_level_(isolation_level),
-        start_ts_(start_ts),
-        range_(range),
-        limit_(limit),
-        key_only_(key_only),
-        is_reverse_(is_reverse),
-        resolved_locks_(resolved_locks),
-        disable_coprocessor_(disable_coprocessor),
-        coprocessor_(coprocessor),
-        txn_result_info_(txn_result_info) {
-    global_start_time_ = GetCurrentTime();
-  }
-
-  ~TxnScanTimeConsumption() {
-    global_end_time_ = GetCurrentTime();
-    global_duration_ =
-        std::chrono::duration_cast<std::chrono::microseconds>(global_end_time_ - global_start_time_).count();
-
-    format_string_ = fmt::format(
-        "[txn][{}] Scan start_ts: {} range: {} isolation_level: {} start_ts: {} limit: {} key_only: {} is_reverse: {} "
-        "resolved_locks size: {} disable_coprocessor: {} coprocessor: {} txn_result_info: {}.",
-        stream_->StreamId(), start_ts_, Helper::RangeToString(range_), pb::store::IsolationLevel_Name(isolation_level_),
-        start_ts_, limit_, key_only_, is_reverse_, resolved_locks_.size(), disable_coprocessor_,
-        coprocessor_.ShortDebugString(), txn_result_info_.ShortDebugString());
-
-    Output();
-  }
-
-  static std::chrono::steady_clock::time_point GetCurrentTime() { return std::chrono::steady_clock::now(); }
-
-  void Start(const std::string &op_name) {
-    auto start_time = std::chrono::steady_clock::now();
-
-    auto iter = operator_durations_.find(op_name);
-    if (iter != operator_durations_.end()) {
-      iter->second.start_time = start_time;
-      iter->second.end_time = {};
-      iter->second.count++;
-    } else {
-      OperatorDuration op_duration(op_name, start_time);
-      operator_durations_.insert({op_name, std::move(op_duration)});
-    }
-  }
-
-  void Stop(const std::string &op_name) {
-    auto end_time = std::chrono::steady_clock::now();
-    auto iter = operator_durations_.find(op_name);
-    if (iter == operator_durations_.end()) {
-      DINGO_LOG(FATAL) << fmt::format("[txn][{}] Stop not found op_name: {}.", stream_->StreamId(), op_name);
-    } else {
-      iter->second.end_time = end_time;
-      iter->second.duration +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end_time - iter->second.start_time).count();
-      iter->second.start_time = {};
-      iter->second.end_time = {};
-    }
-  }
-
-  void FormatMap() {
-    std::vector<OperatorDuration> vt_operator_durations;
-    int64_t misc_duration = 0;
-    int64_t accumulative_duration = 0;
-    for (const auto &pair : operator_durations_) {
-      const auto &op_name = pair.first;
-      const auto &duration = pair.second;
-
-      vt_operator_durations.push_back(duration);
-
-      accumulative_duration += duration.duration;
-    }
-
-    misc_duration = global_duration_ - accumulative_duration;
-
-    OperatorDuration misc_duration_op("misc", GetCurrentTime());
-    misc_duration_op.duration = misc_duration;
-    misc_duration_op.count = 1;
-
-    vt_operator_durations.push_back(misc_duration_op);
-
-    OperatorDuration global_duration_op("global", GetCurrentTime());
-    global_duration_op.duration = global_duration_;
-    global_duration_op.count = 1;
-
-    vt_operator_durations.push_back(global_duration_op);
-
-    // Sort by duration descending
-    std::sort(vt_operator_durations.begin(), vt_operator_durations.end(),
-              [](const OperatorDuration &a, const OperatorDuration &b) { return a.duration > b.duration; });
-
-    // Format the output string
-    for (const auto &op_duration : vt_operator_durations) {
-      format_string_ += fmt::format("\nOperator: {:<40}  duration: {:<20} us count: {:<10}", op_duration.name,
-                                    op_duration.duration, op_duration.count);
-    }
-
-    format_string_ += fmt::format("\n\n");
-  }
-
-  void Output() {
-    FormatMap();
-    DINGO_LOG(WARNING) << format_string_;
-  }
-
- private:
-  std::chrono::steady_clock::time_point global_start_time_;
-  std::chrono::steady_clock::time_point global_end_time_;
-  int64_t global_duration_ = 0;
-  std::map<std::string, OperatorDuration> operator_durations_;
-  std::string format_string_;
-
-  StreamPtr stream_;
-  pb::store::IsolationLevel isolation_level_;
-  int64_t start_ts_;
-  pb::common::Range range_;
-  int64_t limit_;
-  bool key_only_;
-  bool is_reverse_;
-  std::set<int64_t> resolved_locks_;
-  bool disable_coprocessor_;
-  pb::common::CoprocessorV2 coprocessor_;
-  pb::store::TxnResultInfo txn_result_info_;
-};
-
 butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
                                     const pb::store::IsolationLevel &isolation_level, int64_t start_ts,
                                     const pb::common::Range &range, int64_t limit, bool key_only, bool is_reverse,
@@ -1566,7 +2066,7 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
       if (FLAGS_enable_monitor_txn_scan_time_consumption) {
         scan_time_consumption->Start("TxnIterator::Next");
       }
-      iter->Next();
+      iter->Next(scan_time_consumption);
       if (FLAGS_enable_monitor_txn_scan_time_consumption) {
         scan_time_consumption->Stop("TxnIterator::Next");
       }
@@ -1578,7 +2078,7 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
   }
   if (iter->Valid(txn_result_info)) {
     end_scan_key = iter->Key();
-    iter->Next();
+    iter->Next(scan_time_consumption);
   }
   if (FLAGS_enable_monitor_txn_scan_time_consumption /*&& disable_coprocessor*/) {
     scan_time_consumption->Stop("TxnIterator::Valid::Key::Next");

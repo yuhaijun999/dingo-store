@@ -61,6 +61,8 @@ class TxnReader {
   std::shared_ptr<Iterator> write_iter_;
 };
 
+class TxnScanTimeConsumption;
+
 class TxnIterator {
  public:
   TxnIterator(RawEnginePtr raw_engine, const pb::common::Range &range, int64_t start_ts,
@@ -82,7 +84,9 @@ class TxnIterator {
   butil::Status Seek(const std::string &key);
   butil::Status InnerSeek(const std::string &key);
   butil::Status Next();
+  butil::Status Next(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption);
   butil::Status InnerNext();
+  butil::Status InnerNext(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption);
   bool Valid(pb::store::TxnResultInfo &txn_result_info);
   std::string Key();
   std::string Value();
@@ -95,12 +99,20 @@ class TxnIterator {
                                                int64_t start_ts, const std::string &user_key,
                                                std::string &last_write_key, bool &is_value_found,
                                                std::string &user_value);
+  static butil::Status GetUserValueInWriteIter(
+      std::shared_ptr<Iterator> write_iter, RawEngine::ReaderPtr reader, pb::store::IsolationLevel isolation_level,
+      int64_t seek_ts, int64_t start_ts, const std::string &user_key, std::string &last_write_key, bool &is_value_found,
+      std::string &user_value, const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption);
   static std::string GetUserKey(std::shared_ptr<Iterator> write_iter);
   static butil::Status GotoNextUserKeyInWriteIter(std::shared_ptr<Iterator> write_iter, std::string prev_user_key,
                                                   std::string &last_write_key);
+  static butil::Status GotoNextUserKeyInWriteIter(
+      std::shared_ptr<Iterator> write_iter, std::string prev_user_key, std::string &last_write_key,
+      const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption);
 
  private:
   butil::Status GetCurrentValue();
+  butil::Status GetCurrentValue(const std::shared_ptr<TxnScanTimeConsumption> &txn_scan_time_consumption);
 
   RawEnginePtr raw_engine_;
   pb::common::Range range_;
