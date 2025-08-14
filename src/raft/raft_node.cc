@@ -35,6 +35,8 @@
 
 DEFINE_int32(node_destroy_wait_time_ms, 3000, "wait time on node destroy");
 
+DEFINE_bool(braft_node_options_usercode_in_pthread, false, "whether user code runs in pthread");
+
 namespace dingodb {
 
 RaftNode::RaftNode(int64_t node_id, const std::string& raft_group_name, braft::PeerId peer_id,
@@ -75,6 +77,7 @@ int RaftNode::Init(store::RegionPtr region, const std::string& init_conf, const 
 
   node_options.log_storage = new wal::RocksLogStorageWrapper(node_id_, log_storage_);
   node_options.node_owns_log_storage = true;
+  node_options.usercode_in_pthread = FLAGS_braft_node_options_usercode_in_pthread;
 
   // coordinator's region does not have store_region_meta, so coordinator will pass nullptr to call AddNode.
   // only store/index's region has store_region_meta, its region != nullptr, we used our own snapshot adaptor.
