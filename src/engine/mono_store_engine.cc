@@ -614,6 +614,12 @@ butil::Status MonoStoreEngine::TxnReader::TxnScanLock(std::shared_ptr<Context> c
                                        lock_infos, has_more, end_scan_key);
 }
 
+butil::Status MonoStoreEngine::TxnReader::TxnCount(std::shared_ptr<Context> ctx, int64_t start_ts,
+                                                   const pb::common::Range& range,
+                                                   const std::set<int64_t>& resolved_locks, int64_t& count) {
+  return TxnEngineHelper::Count(txn_reader_raw_engine_, ctx->IsolationLevel(), start_ts, range, resolved_locks, count);
+}
+
 butil::Status MonoStoreEngine::TxnWriter::TxnPessimisticLock(std::shared_ptr<Context> ctx,
                                                              const std::vector<pb::store::Mutation>& mutations,
                                                              const std::string& primary_lock, int64_t start_ts,

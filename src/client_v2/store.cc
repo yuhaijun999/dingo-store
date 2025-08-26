@@ -1977,6 +1977,7 @@ void SendDumpRegion(int64_t region_id, int64_t offset, int64_t limit, std::vecto
   dingodb::pb::meta::TableDefinition table_definition;
   auto status = GetTableOrIndexDefinition(response.table_id(), table_definition);
   if (!status.ok()) {
+    Pretty::Show(response.data());
     Pretty::ShowError(status);
     return;
   }

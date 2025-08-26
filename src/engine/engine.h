@@ -271,6 +271,8 @@ class Engine : public std::enable_shared_from_this<Engine> {
                                       const pb::common::Range& range, int64_t limit,
                                       std::vector<pb::store::LockInfo>& lock_infos, bool& has_more,
                                       std::string& end_scan_key) = 0;
+    virtual butil::Status TxnCount(std::shared_ptr<Context> ctx, int64_t start_ts, const pb::common::Range& range,
+                                   const std::set<int64_t>& resolved_locks, int64_t& count) = 0;
   };
   using TxnReaderPtr = std::shared_ptr<TxnReader>;
 

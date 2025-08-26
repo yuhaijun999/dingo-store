@@ -102,6 +102,8 @@ class StoreServiceImpl : public pb::store::StoreService {
                    pb::store::TxnScanLockResponse* response, google::protobuf::Closure* done) override;
   void TxnDump(google::protobuf::RpcController* controller, const pb::store::TxnDumpRequest* request,
                pb::store::TxnDumpResponse* response, google::protobuf::Closure* done) override;
+  void TxnCount(google::protobuf::RpcController* controller, const pb::store::TxnCountRequest* request,
+               pb::store::TxnCountResponse* response, google::protobuf::Closure* done) override;
 
   // txn write
   void TxnPessimisticLock(google::protobuf::RpcController* controller,
