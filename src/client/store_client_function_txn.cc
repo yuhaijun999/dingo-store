@@ -1576,4 +1576,47 @@ void SendTxnDump(int64_t region_id) {
   }
 }
 
+void SendTxnCount(int64_t region_id) {
+  dingodb::pb::common::Region region;
+  if (!TxnGetRegion(region_id, region)) {
+    DINGO_LOG(ERROR) << "TxnGetRegion failed";
+    return;
+  }
+
+  std::string service_name = GetServiceName(region);
+
+  dingodb::pb::store::TxnCountRequest request;
+  dingodb::pb::store::TxnCountResponse response;
+
+  request.mutable_context()->set_region_id(region_id);
+  *request.mutable_context()->mutable_region_epoch() = region.definition().epoch();
+  if (FLAGS_rc) {
+    request.mutable_context()->set_isolation_level(dingodb::pb::store::IsolationLevel::ReadCommitted);
+  } else {
+    request.mutable_context()->set_isolation_level(dingodb::pb::store::IsolationLevel::SnapshotIsolation);
+  }
+
+  dingodb::pb::common::RangeWithOptions range;
+  range.mutable_range()->set_start_key(region.definition().range().start_key());
+  range.mutable_range()->set_end_key(region.definition().range().end_key());
+  range.set_with_start(true);
+  range.set_with_end(false);
+  *request.mutable_range() = range;
+
+  if (FLAGS_start_ts == 0) {
+    FLAGS_start_ts = INT64_MAX;
+  }
+  request.set_start_ts(FLAGS_start_ts);
+
+  if (FLAGS_resolve_locks > 0) {
+    request.mutable_context()->add_resolved_locks(FLAGS_resolve_locks);
+  }
+
+  DINGO_LOG(INFO) << "Request: " << request.DebugString();
+
+  InteractionManager::GetInstance().SendRequestWithContext(service_name, "TxnCount", request, response);
+
+  DINGO_LOG(INFO) << "Response: " << response.DebugString();
+}
+
 }  // namespace client

@@ -1656,6 +1656,28 @@ butil::Status Storage::TxnDump(std::shared_ptr<Context> ctx, const std::string& 
   return butil::Status::OK();
 }
 
+butil::Status Storage::TxnCount(std::shared_ptr<Context> ctx, int64_t start_ts, const pb::common::Range& range,
+                                const std::set<int64_t>& resolved_locks, int64_t& count) {
+  auto status = ValidateLeader(ctx->RegionId());
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    return status;
+  }
+
+  auto reader = GetEngineTxnReader(ctx->StoreEngineType(), ctx->RawEngineType());
+
+  status = reader->TxnCount(ctx, start_ts, range, resolved_locks, count);
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    if (pb::error::EKEY_NOT_FOUND == status.error_code()) {
+      // return OK if not found
+      return butil::Status::OK();
+    }
+
+    return status;
+  }
+
+  return butil::Status::OK();
+}
+
 butil::Status Storage::PrepareMerge(std::shared_ptr<Context> ctx, int64_t job_id,
                                     const pb::common::RegionDefinition& region_definition, int64_t min_applied_log_id) {
   if (BAIDU_LIKELY(ctx->StoreEngineType() == pb::common::StorageEngine::STORE_ENG_RAFT_STORE)) {

@@ -1435,6 +1435,39 @@ butil::Status TxnEngineHelper::Scan(StreamPtr stream, RawEnginePtr raw_engine,
   return butil::Status::OK();
 }
 
+butil::Status TxnEngineHelper::Count(RawEnginePtr raw_engine, const pb::store::IsolationLevel &isolation_level,
+                                     int64_t start_ts, const pb::common::Range &range,
+                                     const std::set<int64_t> &resolved_locks, int64_t &count) {
+  BvarLatencyGuard bvar_guard(&g_txn_scan_latency);
+
+  DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail) << fmt::format(
+      "[txn][{}] Count start_ts: {} range: {} isolation_level: {} start_ts: {} "
+      "resolved_locks size: {}.",
+      start_ts, Helper::RangeToString(range), pb::store::IsolationLevel_Name(isolation_level), start_ts,
+      resolved_locks.size());
+
+  count = 0;
+  if (isolation_level != pb::store::SnapshotIsolation && isolation_level != pb::store::ReadCommitted) {
+    DINGO_LOG(ERROR) << fmt::format("[txn] TxnCount invalid isolation_level: {}.",
+                                    pb::store::IsolationLevel_Name(isolation_level));
+    return butil::Status(pb::error::Errno::EILLEGAL_PARAMTETERS, "invalid isolation_level");
+  }
+
+  auto iter = std::make_shared<TxnIterator>(raw_engine, range, start_ts, isolation_level, resolved_locks);
+  auto ret = iter->Init();
+  CHECK(ret.ok()) << fmt::format("[txn] Scan init txn_iter failed, start_ts: {} range: {}  status: {}.", start_ts,
+                                 Helper::RangeToString(range), ret.error_str());
+  iter->Seek(range.start_key());
+
+  pb::store::TxnResultInfo txn_result_info;
+  while (iter->Valid(txn_result_info)) {
+    count++;
+    iter->Next();
+  }
+
+  return butil::Status::OK();
+}
+
 bvar::LatencyRecorder g_txn_pessimistic_lock_latency("dingo_txn_pessimistic_lock");
 
 butil::Status TxnEngineHelper::PessimisticLock(RawEnginePtr raw_engine, std::shared_ptr<Engine> raft_engine,

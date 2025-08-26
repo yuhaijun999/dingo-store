@@ -3953,6 +3953,116 @@ void StoreServiceImpl::TxnDump(google::protobuf::RpcController* controller, cons
   }
 }
 
+static butil::Status ValidateTxnCountRequest(const pb::store::TxnCountRequest* request, store::RegionPtr region,
+                                             const pb::common::Range& req_range) {
+  if (request->start_ts() < 0) {
+    return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "param start_ts is invalid");
+  }
+  auto status = ServiceHelper::ValidateRegionEpoch(request->context().region_epoch(), region);
+  if (!status.ok()) {
+    return status;
+  }
+
+  status = ServiceHelper::ValidateRange(req_range);
+  if (!status.ok()) {
+    return status;
+  }
+
+  status = ServiceHelper::ValidateRangeInRange(region->Range(false), req_range);
+  if (!status.ok()) {
+    return status;
+  }
+
+  status = ServiceHelper::ValidateRegionState(region);
+  if (!status.ok()) {
+    return status;
+  }
+
+  return butil::Status();
+}
+
+void DoTxnCount(StoragePtr storage, google::protobuf::RpcController* controller,
+                const dingodb::pb::store::TxnCountRequest* request, dingodb::pb::store::TxnCountResponse* response,
+                TrackClosure* done) {
+  brpc::Controller* cntl = (brpc::Controller*)controller;
+  brpc::ClosureGuard done_guard(done);
+  auto tracker = done->Tracker();
+  tracker->SetServiceQueueWaitTime();
+
+  auto region = done->GetRegion();
+  int64_t region_id = request->context().region_id();
+  region->SetTxnAccessMaxTs(request->start_ts());
+  auto uniform_range = Helper::TransformRangeWithOptions(request->range());
+  butil::Status status = ValidateTxnCountRequest(request, region, uniform_range);
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    if (pb::error::ERANGE_INVALID != static_cast<pb::error::Errno>(status.error_code())) {
+      ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+      ServiceHelper::GetStoreRegionInfo(region, response->mutable_error());
+    }
+    return;
+  }
+
+  std::set<int64_t> resolved_locks;
+  for (const auto& lock : request->context().resolved_locks()) {
+    resolved_locks.insert(lock);
+  }
+
+  pb::store::TxnResultInfo txn_result_info;
+
+  auto correction_range = Helper::IntersectRange(region->Range(false), uniform_range);
+  // read key check
+  if (request->context().isolation_level() == pb::store::IsolationLevel::SnapshotIsolation &&
+      region->CheckRange(correction_range.start_key(), correction_range.end_key(), request->context().isolation_level(),
+                         request->start_ts(), resolved_locks, txn_result_info)) {
+    ServiceHelper::SetError(response->mutable_error(), pb::error::Errno::ETXN_MEMORY_LOCK_CONFLICT,
+                            "Meet memory lock, please try later");
+    return;
+  }
+
+  std::shared_ptr<Context> ctx = std::make_shared<Context>();
+  ctx->SetRegionId(region_id);
+  ctx->SetTracker(tracker);
+  ctx->SetCfName(Constant::kStoreDataCF);
+  ctx->SetRegionEpoch(request->context().region_epoch());
+  ctx->SetIsolationLevel(request->context().isolation_level());
+  ctx->SetRawEngineType(region->GetRawEngineType());
+  ctx->SetStoreEngineType(region->GetStoreEngineType());
+
+  int64_t count = 0;
+
+  status = storage->TxnCount(ctx, request->start_ts(), correction_range, resolved_locks, count);
+
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+    return;
+  }
+
+  response->set_count(count);
+
+  tracker->SetReadStoreTime();
+}
+
+void StoreServiceImpl::TxnCount(google::protobuf::RpcController* controller, const pb::store::TxnCountRequest* request,
+                                pb::store::TxnCountResponse* response, google::protobuf::Closure* done) {
+  auto* svr_done = new ServiceClosure(__func__, done, request, response);
+
+  if (BAIDU_UNLIKELY(svr_done->GetRegion() == nullptr)) {
+    brpc::ClosureGuard done_guard(svr_done);
+    return;
+  }
+
+  // Run in queue.
+  auto task = std::make_shared<ServiceTask>([this, controller, request, response, svr_done]() {
+    DoTxnCount(storage_, controller, request, response, svr_done);
+  });
+  bool ret = read_worker_set_->ExecuteRR(task);
+  if (BAIDU_UNLIKELY(!ret)) {
+    brpc::ClosureGuard done_guard(svr_done);
+    ServiceHelper::SetError(response->mutable_error(), pb::error::EREQUEST_FULL,
+                            "WorkerSet queue is full, please wait and retry");
+  }
+}
+
 void DoHello(google::protobuf::RpcController* controller, const dingodb::pb::store::HelloRequest* request,
              dingodb::pb::store::HelloResponse* response, TrackClosure* done, bool is_get_memory_info = false) {
   brpc::Controller* cntl = (brpc::Controller*)controller;

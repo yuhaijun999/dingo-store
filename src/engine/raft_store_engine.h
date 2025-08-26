@@ -237,6 +237,8 @@ class RaftStoreEngine : public Engine, public RaftControlAble {
                               const pb::common::Range& range, int64_t limit,
                               std::vector<pb::store::LockInfo>& lock_infos, bool& has_more,
                               std::string& end_scan_key) override;
+    butil::Status TxnCount(std::shared_ptr<Context> ctx, int64_t start_ts, const pb::common::Range& range, const std::set<int64_t>& resolved_locks,
+                           int64_t& count) override;
 
    private:
     RawEnginePtr txn_reader_raw_engine_;
