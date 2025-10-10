@@ -67,8 +67,7 @@ class DocumentIndex {
   butil::Status Load(const std::string& path);
 
   butil::Status Search(uint32_t topk, const std::string& query_string, bool use_range_filter, int64_t start_id,
-                       int64_t end_id, bool use_id_filter, bool query_unlimited,
-                       const std::vector<uint64_t>& alive_ids,
+                       int64_t end_id, bool use_id_filter, bool query_unlimited, const std::vector<uint64_t>& alive_ids,
                        const std::vector<std::string>& column_names,
                        std::vector<pb::common::DocumentWithScore>& results);
 
@@ -126,12 +125,27 @@ class DocumentIndex {
 
 using DocumentIndexPtr = std::shared_ptr<DocumentIndex>;
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+enum class UseDocumentPurposeType : uint8_t { kNone = 0, kDocumentModule = 1, kVectorIndexModule = 2 };
+#endif
+
 class DocumentIndexWrapper : public std::enable_shared_from_this<DocumentIndexWrapper> {
  public:
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  DocumentIndexWrapper(int64_t id, pb::common::DocumentIndexParameter index_parameter,
+                       UseDocumentPurposeType use_document_purpose_type);
+#else
   DocumentIndexWrapper(int64_t id, pb::common::DocumentIndexParameter index_parameter);
+#endif
+
   ~DocumentIndexWrapper();
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  static std::shared_ptr<DocumentIndexWrapper> New(int64_t id, pb::common::DocumentIndexParameter index_parameter,
+                                                   UseDocumentPurposeType use_document_purpose_type);
+#else
   static std::shared_ptr<DocumentIndexWrapper> New(int64_t id, pb::common::DocumentIndexParameter index_parameter);
+#endif
 
   std::shared_ptr<DocumentIndexWrapper> GetSelf();
 
@@ -222,6 +236,10 @@ class DocumentIndexWrapper : public std::enable_shared_from_this<DocumentIndexWr
   butil::Status Search(const pb::common::Range& region_range, const pb::common::DocumentSearchParameter& parameter,
                        std::vector<pb::common::DocumentWithScore>& results);
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  UseDocumentPurposeType GetUseDocumentPurposeType() const { return use_document_purpose_type_; }
+#endif
+
  private:
   // document index id
   int64_t id_;
@@ -261,6 +279,10 @@ class DocumentIndexWrapper : public std::enable_shared_from_this<DocumentIndexWr
   std::atomic<int32_t> loadorbuilding_num_;
   // document index rebuilding num
   std::atomic<int32_t> rebuilding_num_;
+
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  UseDocumentPurposeType use_document_purpose_type_;
+#endif
 };
 
 using DocumentIndexWrapperPtr = std::shared_ptr<DocumentIndexWrapper>;

@@ -135,6 +135,18 @@ bool RaftStoreEngine::Recover() {
         }
       }
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+      if (GetRole() == pb::common::INDEX) {
+        const auto& definition = region->Definition();
+        if (definition.index_parameter().vector_index_parameter().enable_scalar_speed_up_with_document()) {
+          auto document_index_wrapper = region->DocumentIndexWrapper();
+          if (document_index_wrapper != nullptr) {
+            DocumentIndexManager::LaunchLoadOrBuildDocumentIndex(document_index_wrapper, false, false, 0, "recover");
+          }
+        }
+      }
+#endif
+
       if (GetRole() == pb::common::DOCUMENT) {
         auto document_index_wrapper = region->DocumentIndexWrapper();
         DocumentIndexManager::LaunchLoadOrBuildDocumentIndex(document_index_wrapper, false, false, 0, "recover");

@@ -134,6 +134,14 @@ class VectorReader {
       const pb::common::ScalarSchema& scalar_schema,
       std::vector<pb::index::VectorWithDistanceResult>& vector_with_distance_results);
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  butil::Status DoVectorSearchForScalarPreFilterWithDocument(
+      VectorIndexWrapperPtr vector_index, pb::common::Range region_range,
+      const std::vector<pb::common::VectorWithId>& vector_with_ids, const pb::common::VectorSearchParameter& parameter,
+      const pb::common::ScalarSchema& scalar_schema,
+      std::vector<pb::index::VectorWithDistanceResult>& vector_with_distance_results);
+#endif
+
   static bool ScalarCompareCore(const pb::common::VectorScalardata& std_vector_scalar,
                                 const pb::common::VectorScalardata& internal_vector_scalar);
 

@@ -60,6 +60,7 @@ build/
 dist/
 .vscode/
 *.bak
+build_release/
 
 # Maven Files
 target/

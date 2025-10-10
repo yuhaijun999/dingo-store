@@ -14,6 +14,7 @@
 
 #include "document/document_index.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -519,7 +520,22 @@ butil::Status DocumentIndex::GetJsonParameter(std::string& json) {
 
   return butil::Status::OK();
 }
-
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+DocumentIndexWrapper::DocumentIndexWrapper(int64_t id, pb::common::DocumentIndexParameter index_parameter,
+                                           UseDocumentPurposeType use_document_purpose_type)
+    : id_(id),
+      ready_(false),
+      destroyed_(false),
+      is_switching_document_index_(false),
+      index_parameter_(index_parameter),
+      pending_task_num_(0),
+      loadorbuilding_num_(0),
+      rebuilding_num_(0),
+      use_document_purpose_type_(use_document_purpose_type) {
+  bthread_mutex_init(&document_index_mutex_, nullptr);
+  DINGO_LOG(DEBUG) << fmt::format("[new.DocumentIndexWrapper][id({})]", id_);
+}
+#else
 DocumentIndexWrapper::DocumentIndexWrapper(int64_t id, pb::common::DocumentIndexParameter index_parameter)
     : id_(id),
       ready_(false),
@@ -532,6 +548,7 @@ DocumentIndexWrapper::DocumentIndexWrapper(int64_t id, pb::common::DocumentIndex
   bthread_mutex_init(&document_index_mutex_, nullptr);
   DINGO_LOG(DEBUG) << fmt::format("[new.DocumentIndexWrapper][id({})]", id_);
 }
+#endif
 
 DocumentIndexWrapper::~DocumentIndexWrapper() {
   ClearDocumentIndex("destruct");
@@ -544,6 +561,21 @@ DocumentIndexWrapper::~DocumentIndexWrapper() {
   }
 }
 
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+std::shared_ptr<DocumentIndexWrapper> DocumentIndexWrapper::New(int64_t id,
+                                                                pb::common::DocumentIndexParameter index_parameter,
+                                                                UseDocumentPurposeType use_document_purpose_type) {
+  auto document_index_wrapper = std::make_shared<DocumentIndexWrapper>(id, index_parameter, use_document_purpose_type);
+  if (document_index_wrapper != nullptr) {
+    if (!document_index_wrapper->Init()) {
+      return nullptr;
+    }
+  }
+
+  return document_index_wrapper;
+}
+#else
+
 std::shared_ptr<DocumentIndexWrapper> DocumentIndexWrapper::New(int64_t id,
                                                                 pb::common::DocumentIndexParameter index_parameter) {
   auto document_index_wrapper = std::make_shared<DocumentIndexWrapper>(id, index_parameter);
@@ -555,6 +587,7 @@ std::shared_ptr<DocumentIndexWrapper> DocumentIndexWrapper::New(int64_t id,
 
   return document_index_wrapper;
 }
+#endif
 
 std::shared_ptr<DocumentIndexWrapper> DocumentIndexWrapper::GetSelf() { return shared_from_this(); }
 
@@ -1034,7 +1067,22 @@ butil::Status DocumentIndexWrapper::Delete(const std::vector<int64_t>& delete_id
 static void MergeSearchResult(uint32_t topk, std::vector<pb::common::DocumentWithScore>& input_1,
                               std::vector<pb::common::DocumentWithScore>& input_2,
                               std::vector<pb::common::DocumentWithScore>& results) {
-  if (topk == 0) return;
+  if (topk == 0) {
+    results = input_1;
+    results.insert(results.end(), input_2.begin(), input_2.end());
+
+    std::sort(results.begin(), results.end(),
+              [](const pb::common::DocumentWithScore& a, const pb::common::DocumentWithScore& b) {
+                return a.document_with_id().id() < b.document_with_id().id();
+              });
+    auto last = std::unique(results.begin(), results.end(),
+                            [](const pb::common::DocumentWithScore& a, const pb::common::DocumentWithScore& b) {
+                              return a.document_with_id().id() == b.document_with_id().id();
+                            });
+    results.erase(last, results.end());
+
+    return;
+  }
   int input_1_size = input_1.size();
   int input_2_size = input_2.size();
   const auto& document_with_scores_1 = input_1;
