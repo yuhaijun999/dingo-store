@@ -344,7 +344,7 @@ butil::Status VectorIndexUtils::DoCalcHammingDistanceByFaiss(
   distance = vector_distance(left_vectors.data(), right_vectors.data());
 
   ResultOpBinaryVectorAssignmentWrapper(op_left_vectors, op_right_vectors, is_return_normlize, result_op_left_vectors,
-                                  result_op_right_vectors);
+                                        result_op_right_vectors);
 
   return butil::Status();
 }
@@ -429,7 +429,7 @@ void VectorIndexUtils::ResultOpVectorAssignment(dingodb::pb::common::Vector& res
 }
 
 void VectorIndexUtils::ResultOpBinaryVectorAssignment(dingodb::pb::common::Vector& result_op_vectors,
-                                           const ::dingodb::pb::common::Vector& op_vectors) {
+                                                      const ::dingodb::pb::common::Vector& op_vectors) {
   result_op_vectors = op_vectors;
   result_op_vectors.set_dimension(result_op_vectors.binary_values().size() * CHAR_BIT);
   result_op_vectors.set_value_type(::dingodb::pb::common::ValueType::UINT8);
@@ -1031,13 +1031,13 @@ butil::Status VectorIndexUtils::ValidateVectorIndexParameter(
       return butil::Status(pb::error::Errno::EILLEGAL_PARAMTETERS, s);
     }
   }
-#if 10
+
   butil::Status status = ValidateDiskannParameter(vector_index_parameter);
   if (!status.ok()) {
     DINGO_LOG(ERROR) << status.error_cstr();
     return status;
   }
-#endif
+
   if (vector_index_parameter.vector_index_type() == pb::common::VectorIndexType::VECTOR_INDEX_TYPE_BINARY_FLAT) {
     if (!vector_index_parameter.has_binary_flat_parameter()) {
       DINGO_LOG(ERROR) << "vector_index_type is Binary FLAT, but has_binary_flat_parameter is not set";

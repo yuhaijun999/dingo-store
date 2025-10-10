@@ -30,8 +30,12 @@ namespace mvcc {
 enum class ValueFlag : uint8_t { kPut = 0, kPutTTL = 1, kDelete = 2 };
 
 class Codec {
+ private:
+  static inline std::string value_flag_delete = std::string(1, static_cast<char>(ValueFlag::kDelete));
+
  public:
   static std::string ValueFlagDelete() { return std::string(1, static_cast<char>(ValueFlag::kDelete)); }
+  static bool IsFlagDelete(const std::string& value_flag) { return value_flag_delete == value_flag; }
 
   // encode user key to comparable bytes
   // e.g.

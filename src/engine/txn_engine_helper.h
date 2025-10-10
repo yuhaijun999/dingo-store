@@ -270,7 +270,13 @@ class TxnEngineHelper {
                                                                   std::shared_ptr<Context> ctx,
                                                                   const std::vector<std::string> &kv_deletes_default,
                                                                   int64_t tenant_id, pb::common::RegionType type);
-
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  static butil::Status RaftEngineWriteForNonTxnIndexGc(
+      std::shared_ptr<Engine> raft_engine, std::shared_ptr<Context> ctx,
+      const std::vector<std::string> &kv_deletes_default, const std::vector<std::string> &kv_deletes_scalar,
+      const std::vector<std::string> &kv_deletes_table, const std::vector<std::string> &kv_deletes_scalar_speedup,
+      const std::vector<std::string> &kv_deletes_use_document, int64_t tenant_id, pb::common::RegionType type);
+#else
   static butil::Status RaftEngineWriteForNonTxnIndexGc(std::shared_ptr<Engine> raft_engine,
                                                        std::shared_ptr<Context> ctx,
                                                        const std::vector<std::string> &kv_deletes_default,
@@ -278,6 +284,7 @@ class TxnEngineHelper {
                                                        const std::vector<std::string> &kv_deletes_table,
                                                        const std::vector<std::string> &kv_deletes_scalar_speedup,
                                                        int64_t tenant_id, pb::common::RegionType type);
+#endif
 
   static butil::Status RaftEngineWrite(std::shared_ptr<Engine> raft_engine, std::shared_ptr<Context> ctx,
                                        pb::raft::TxnRaftRequest &txn_raft_request, int64_t tenant_id,
@@ -293,19 +300,28 @@ class TxnEngineHelper {
                                            std::string &lock_start_key,                                  // NOLINT
                                            std::string &lock_end_key, std::string &last_lock_start_key,  // NOLINT
                                            std::string &last_lock_end_key);                              // NOLINT
-
+#if WITH_VECTOR_INDEX_USE_DOCUMENT_SPEEDUP
+  static butil::Status DoFinalWorkForNonTxnGc(std::shared_ptr<Engine> raft_engine, std::shared_ptr<Context> ctx,
+                                              int64_t tenant_id, pb::common::RegionType type,
+                                              std::vector<std::string> &kv_deletes_default,
+                                              std::vector<std::string> &kv_deletes_scalar,
+                                              std::vector<std::string> &kv_deletes_table,
+                                              std::vector<std::string> &kv_deletes_scalar_speedup,
+                                              std::vector<std::string> &kv_deletes_use_document);
+#else
   static butil::Status DoFinalWorkForNonTxnGc(std::shared_ptr<Engine> raft_engine, std::shared_ptr<Context> ctx,
                                               int64_t tenant_id, pb::common::RegionType type,
                                               std::vector<std::string> &kv_deletes_default,
                                               std::vector<std::string> &kv_deletes_scalar,
                                               std::vector<std::string> &kv_deletes_table,
                                               std::vector<std::string> &kv_deletes_scalar_speedup);
+#endif
 
   static void RegularUpdateSafePointTsHandler(void *arg);
   static void RegularDoGcHandler(void *arg);
 
-  static int64_t GenFinalMinCommitTs(store::RegionPtr region, pb::store::LockInfo &lock_info, std::string key, int64_t start_ts,
-                                  int64_t for_update_ts, int64_t max_commit_ts);
+  static int64_t GenFinalMinCommitTs(store::RegionPtr region, pb::store::LockInfo &lock_info, std::string key,
+                                     int64_t start_ts, int64_t for_update_ts, int64_t max_commit_ts);
 
   static butil::Status GenPrewriteDataAndLock(
       store::RegionPtr region, const pb::store::Mutation &mutation, const pb::store::LockInfo &prev_lock_info,
@@ -467,15 +483,15 @@ class TxnEngineHelper {
                                                      const std::vector<pb::common::KeyValue> &kv_scalar,
                                                      const std::vector<pb::common::KeyValue> &kv_table,
                                                      const std::vector<std::string> &scalar_speed_up_keys,
-                                                     std::vector<pb::common::VectorWithId> &vector_with_ids, 
-                                                     std::vector<int64_t>& vector_delete_ids);
+                                                     std::vector<pb::common::VectorWithId> &vector_with_ids,
+                                                     std::vector<int64_t> &vector_delete_ids);
 
   static butil::Status PreProcessVectorIndex(const std::vector<pb::common::KeyValue> &kv_default,
                                              const std::vector<pb::common::KeyValue> &kv_scalar,
                                              const std::vector<pb::common::KeyValue> &kv_table,
                                              const std::vector<std::string> &scalar_speed_up_keys,
                                              std::vector<pb::common::VectorWithId> &vector_with_ids,
-                                             std::vector<int64_t>& vector_delete_ids);
+                                             std::vector<int64_t> &vector_delete_ids);
 
   static butil::Status RestoreNonTxnIndex(std::shared_ptr<Context> ctx, store::RegionPtr region,
                                           std::shared_ptr<Engine> raft_engine,
