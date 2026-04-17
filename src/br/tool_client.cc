@@ -17,8 +17,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "br/helper.h"
+#include "butil/strings/string_split.h"
 #include "br/interaction_manager.h"
 #include "br/tool_utils.h"
 #include "br/utils.h"
@@ -163,6 +165,36 @@ butil::Status ToolClient::Run() {
     }
   } else if ("QueryRaftSync" == tool_client_params_.br_client_method) {
     status = QueryRaftSync();
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
+      return status;
+    }
+  } else if ("SetRaftLogAppendSlow" == tool_client_params_.br_client_method) {
+    status = SetRaftLogAppendSlow(tool_client_params_.br_client_method_param1,
+                                  tool_client_params_.br_client_addrs,
+                                  tool_client_params_.br_client_node_type);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
+      return status;
+    }
+  } else if ("QueryRaftLogAppendSlow" == tool_client_params_.br_client_method) {
+    status = QueryRaftLogAppendSlow(tool_client_params_.br_client_addrs,
+                                    tool_client_params_.br_client_node_type);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
+      return status;
+    }
+  } else if ("SetStateMachineApplySlow" == tool_client_params_.br_client_method) {
+    status = SetStateMachineApplySlow(tool_client_params_.br_client_method_param1,
+                                      tool_client_params_.br_client_addrs,
+                                      tool_client_params_.br_client_node_type);
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
+      return status;
+    }
+  } else if ("QueryStateMachineApplySlow" == tool_client_params_.br_client_method) {
+    status = QueryStateMachineApplySlow(tool_client_params_.br_client_addrs,
+                                        tool_client_params_.br_client_node_type);
     if (!status.ok()) {
       DINGO_LOG(ERROR) << Utils::FormatStatusError(status);
       return status;
@@ -860,6 +892,225 @@ butil::Status ToolClient::CoreRaftSync(const std::string& type, const std::strin
         return_status = butil::Status(response.error().errcode(), response.error().errmsg());
         continue;
       }
+    }
+  }
+
+  return return_status;
+}
+
+butil::Status ToolClient::SetRaftLogAppendSlow(const std::string& ms, const std::string& addrs,
+                                               const std::string& node_type) {
+  if (ms.empty()) {
+    std::string s = "SetRaftLogAppendSlow requires --br_client_method_param1=<ms>, e.g. 500 (0 to disable)";
+    DINGO_LOG(ERROR) << s;
+    return butil::Status(dingodb::pb::error::Errno::EINTERNAL, s);
+  }
+  return CoreRaftLogAppendSlow(ms, "SetRaftLogAppendSlow", addrs, node_type);
+}
+
+butil::Status ToolClient::QueryRaftLogAppendSlow(const std::string& addrs, const std::string& node_type) {
+  return CoreRaftLogAppendSlow("query", "QueryRaftLogAppendSlow", addrs, node_type);
+}
+
+// Helper: send ControlConfig request to a single addr and record the result.
+static void SendControlConfigToAddr(const std::string& addr, const std::string& service_name,
+                                    const std::string& action, int index,
+                                    dingodb::pb::store::ControlConfigRequest& request,
+                                    dingodb::pb::store::ControlConfigResponse& response,
+                                    butil::Status& return_status) {
+  response.Clear();
+  std::shared_ptr<br::ServerInteraction> interaction;
+  butil::Status status = br::ServerInteraction::CreateInteraction({addr}, interaction);
+  if (!status.ok()) {
+    DINGO_LOG(ERROR) << br::Utils::FormatStatusError(status);
+    return_status = status;
+    return;
+  }
+  std::string name = fmt::format("[{}] {} {} {}", index, service_name, action, addr);
+  br::ToolUtils::PrintRequest(name, request);
+  status = interaction->SendRequest(service_name, "ControlConfig", request, response);
+  br::ToolUtils::PrintResponse(name, response);
+  if (!status.ok()) {
+    DINGO_LOG(ERROR) << br::Utils::FormatStatusError(status);
+    return_status = status;
+    return;
+  }
+  if (response.error().errcode() != dingodb::pb::error::OK) {
+    DINGO_LOG(ERROR) << br::Utils::FormatResponseError(response);
+    return_status = butil::Status(response.error().errcode(), response.error().errmsg());
+  }
+}
+
+butil::Status ToolClient::CoreRaftLogAppendSlow(const std::string& value, const std::string& action,
+                                                 const std::string& addrs_str,
+                                                 const std::string& node_type_str) {
+  butil::Status return_status;
+
+  dingodb::pb::store::ControlConfigRequest request;
+  dingodb::pb::store::ControlConfigResponse response;
+  request.mutable_request_info()->set_request_id(br::Helper::GetRandInt());
+  dingodb::pb::common::ControlConfigVariable config;
+  config.set_name("FLAGS_rocks_log_append_slow_ms");
+  config.set_value(value);
+  request.mutable_control_config_variable()->Add(std::move(config));
+
+  if (!addrs_str.empty()) {
+    // Operate on explicitly specified nodes only.
+    std::vector<std::string> addrs;
+    butil::SplitString(addrs_str, ',', &addrs);
+
+    std::string service_name = "StoreService";
+    if (node_type_str == "index") {
+      service_name = "IndexService";
+    } else if (node_type_str == "document") {
+      service_name = "DocumentService";
+    } else if (!node_type_str.empty() && node_type_str != "store") {
+      DINGO_LOG(WARNING) << "Unknown --br_client_node_type='" << node_type_str
+                         << "', defaulting to StoreService";
+    }
+
+    int i = 0;
+    for (const auto& addr : addrs) {
+      SendControlConfigToAddr(addr, service_name, action, i++, request, response, return_status);
+    }
+    return return_status;
+  }
+
+  // No addrs specified: operate on all nodes from InteractionManager,
+  // optionally filtered by node_type_str (comma-separated store/index/document).
+  bool filter = !node_type_str.empty();
+  bool use_store = !filter || node_type_str.find("store") != std::string::npos;
+  bool use_index = !filter || node_type_str.find("index") != std::string::npos;
+  bool use_document = !filter || node_type_str.find("document") != std::string::npos;
+
+  auto store_interaction = br::InteractionManager::GetInstance().GetStoreInteraction();
+  auto index_interaction = br::InteractionManager::GetInstance().GetIndexInteraction();
+  auto document_interaction = br::InteractionManager::GetInstance().GetDocumentInteraction();
+
+  bool is_exist_store = use_store && (store_interaction != nullptr ? !store_interaction->IsEmpty() : false);
+  bool is_exist_index = use_index && (index_interaction != nullptr ? !index_interaction->IsEmpty() : false);
+  bool is_exist_document =
+      use_document && (document_interaction != nullptr ? !document_interaction->IsEmpty() : false);
+
+  if (!is_exist_store && !is_exist_index && !is_exist_document) {
+    DINGO_LOG(INFO) << "Store, Index and Document not exist, skip " << action;
+    std::cout << "Store, Index and Document not exist, skip " << action << std::endl;
+    return butil::Status::OK();
+  }
+
+  if (is_exist_store) {
+    int i = 0;
+    for (const auto& addr : store_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "StoreService", action, i++, request, response, return_status);
+    }
+  }
+
+  if (is_exist_index) {
+    int i = 0;
+    for (const auto& addr : index_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "IndexService", action, i++, request, response, return_status);
+    }
+  }
+
+  if (is_exist_document) {
+    int i = 0;
+    for (const auto& addr : document_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "DocumentService", action, i++, request, response, return_status);
+    }
+  }
+
+  return return_status;
+}
+
+butil::Status ToolClient::SetStateMachineApplySlow(const std::string& ms, const std::string& addrs,
+                                                   const std::string& node_type) {
+  if (ms.empty()) {
+    std::string s =
+        "SetStateMachineApplySlow requires --br_client_method_param1=<ms>, e.g. 200 (0 to disable)";
+    DINGO_LOG(ERROR) << s;
+    return butil::Status(dingodb::pb::error::Errno::EINTERNAL, s);
+  }
+  return CoreStateMachineApplySlow(ms, "SetStateMachineApplySlow", addrs, node_type);
+}
+
+butil::Status ToolClient::QueryStateMachineApplySlow(const std::string& addrs, const std::string& node_type) {
+  return CoreStateMachineApplySlow("query", "QueryStateMachineApplySlow", addrs, node_type);
+}
+
+butil::Status ToolClient::CoreStateMachineApplySlow(const std::string& value, const std::string& action,
+                                                     const std::string& addrs_str,
+                                                     const std::string& node_type_str) {
+  butil::Status return_status;
+
+  dingodb::pb::store::ControlConfigRequest request;
+  dingodb::pb::store::ControlConfigResponse response;
+  request.mutable_request_info()->set_request_id(br::Helper::GetRandInt());
+  dingodb::pb::common::ControlConfigVariable config;
+  config.set_name("FLAGS_store_state_machine_apply_slow_ms");
+  config.set_value(value);
+  request.mutable_control_config_variable()->Add(std::move(config));
+
+  if (!addrs_str.empty()) {
+    // Operate on explicitly specified nodes only.
+    std::vector<std::string> addrs;
+    butil::SplitString(addrs_str, ',', &addrs);
+
+    std::string service_name = "StoreService";
+    if (node_type_str == "index") {
+      service_name = "IndexService";
+    } else if (node_type_str == "document") {
+      service_name = "DocumentService";
+    } else if (!node_type_str.empty() && node_type_str != "store") {
+      DINGO_LOG(WARNING) << "Unknown --br_client_node_type='" << node_type_str
+                         << "', defaulting to StoreService";
+    }
+
+    int i = 0;
+    for (const auto& addr : addrs) {
+      SendControlConfigToAddr(addr, service_name, action, i++, request, response, return_status);
+    }
+    return return_status;
+  }
+
+  // No addrs specified: operate on all nodes, optionally filtered by node_type_str.
+  bool filter = !node_type_str.empty();
+  bool use_store = !filter || node_type_str.find("store") != std::string::npos;
+  bool use_index = !filter || node_type_str.find("index") != std::string::npos;
+  bool use_document = !filter || node_type_str.find("document") != std::string::npos;
+
+  auto store_interaction = br::InteractionManager::GetInstance().GetStoreInteraction();
+  auto index_interaction = br::InteractionManager::GetInstance().GetIndexInteraction();
+  auto document_interaction = br::InteractionManager::GetInstance().GetDocumentInteraction();
+
+  bool is_exist_store = use_store && (store_interaction != nullptr ? !store_interaction->IsEmpty() : false);
+  bool is_exist_index = use_index && (index_interaction != nullptr ? !index_interaction->IsEmpty() : false);
+  bool is_exist_document =
+      use_document && (document_interaction != nullptr ? !document_interaction->IsEmpty() : false);
+
+  if (!is_exist_store && !is_exist_index && !is_exist_document) {
+    DINGO_LOG(INFO) << "Store, Index and Document not exist, skip " << action;
+    std::cout << "Store, Index and Document not exist, skip " << action << std::endl;
+    return butil::Status::OK();
+  }
+
+  if (is_exist_store) {
+    int i = 0;
+    for (const auto& addr : store_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "StoreService", action, i++, request, response, return_status);
+    }
+  }
+
+  if (is_exist_index) {
+    int i = 0;
+    for (const auto& addr : index_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "IndexService", action, i++, request, response, return_status);
+    }
+  }
+
+  if (is_exist_document) {
+    int i = 0;
+    for (const auto& addr : document_interaction->GetAddrs()) {
+      SendControlConfigToAddr(addr, "DocumentService", action, i++, request, response, return_status);
     }
   }
 

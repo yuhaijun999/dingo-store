@@ -42,6 +42,11 @@ DEFINE_bool(store_state_machine_enable_independent_queue, false,
             "store state machine enable independent queue. default false");
 BRPC_VALIDATE_GFLAG(store_state_machine_enable_independent_queue, brpc::PassValidate);
 
+DEFINE_int32(store_state_machine_apply_slow_ms, 0,
+             "store state machine inject sleep(ms) per log entry in on_apply to simulate slow apply. "
+             "0 means disabled. Used for testing only.");
+BRPC_VALIDATE_GFLAG(store_state_machine_apply_slow_ms, brpc::NonNegativeInteger);
+
 StoreStateMachine::StoreStateMachine(RawEnginePtr engine, store::RegionPtr region, store::RaftMetaPtr raft_meta,
                                      store::RegionMetricsPtr region_metrics, EventListenerCollectionPtr listeners,
                                      WorkerSetPtr worker_set)
@@ -122,6 +127,12 @@ void StoreStateMachine::on_apply(braft::Iterator& iter) {
     auto tracker = ctx ? ctx->Tracker() : nullptr;
     if (tracker != nullptr) {
       tracker->SetRaftCommitTime();
+    }
+
+    if (BAIDU_UNLIKELY(FLAGS_store_state_machine_apply_slow_ms > 0)) {
+      DINGO_LOG(WARNING) << fmt::format("[raft.sm][region({})] inject slow apply {}ms at log index {}", region_->Id(),
+                                        FLAGS_store_state_machine_apply_slow_ms, iter.index());
+      bthread_usleep(FLAGS_store_state_machine_apply_slow_ms * 1000LL);
     }
 
     // Region is STANDBY state, wait to apply.

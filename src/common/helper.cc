@@ -2520,6 +2520,40 @@ void Helper::HandleBoolControlConfigVariable(const pb::common::ControlConfigVari
   config.set_is_error_occurred(false);
 }
 
+void Helper::HandleInt32ControlConfigVariable(const pb::common::ControlConfigVariable& variable,
+                                              pb::common::ControlConfigVariable& config, int32_t& gflags_var) {
+  // Support "query" mode: return current value without modification
+  if (variable.value() == "query" || variable.value() == "QUERY" || variable.value() == "Query") {
+    config.set_value(std::to_string(gflags_var));
+    config.set_is_already_set(false);
+    config.set_is_error_occurred(false);
+    return;
+  }
+
+  int32_t new_value = 0;
+  try {
+    new_value = std::stoi(variable.value());
+  } catch (const std::exception& e) {
+    config.set_value(std::to_string(gflags_var));
+    config.set_is_already_set(false);
+    config.set_is_error_occurred(true);
+    DINGO_LOG(ERROR) << "ControlConfig variable: " << variable.name() << " value: " << variable.value()
+                     << " is not int32 type: " << e.what() << ", skip.";
+    return;
+  }
+
+  if (new_value == gflags_var) {
+    config.set_value(std::to_string(gflags_var));
+    config.set_is_already_set(true);
+    config.set_is_error_occurred(false);
+  } else {
+    gflags_var = new_value;
+    config.set_value(std::to_string(gflags_var));
+    config.set_is_already_set(false);
+    config.set_is_error_occurred(false);
+  }
+}
+
 size_t Helper::FindReEnd(const std::string& s, size_t start_pos) {
   // Only calculate the outermost
   int bracket_level = 0;

@@ -51,6 +51,8 @@ butil::Status Tool::Init() {
     tool_client_params.br_tool_type = tool_params_.br_tool_type;
     tool_client_params.br_client_method = tool_params_.br_client_method;
     tool_client_params.br_client_method_param1 = tool_params_.br_client_method_param1;
+    tool_client_params.br_client_addrs = tool_params_.br_client_addrs;
+    tool_client_params.br_client_node_type = tool_params_.br_client_node_type;
 
     tool_client_ = std::make_shared<ToolClient>(tool_client_params);
   } else {

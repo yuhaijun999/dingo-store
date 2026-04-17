@@ -615,6 +615,46 @@ int main(int argc, char* argv[]) {
     printf("./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=DisableRaftSync\n");
     printf("./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=EnableRaftSync\n");
     printf("./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryRaftSync\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetRaftLogAppendSlow "
+        "--br_client_method_param1=<ms>  # set all nodes; 0 to disable, >0 to inject sleep(ms)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetRaftLogAppendSlow "
+        "--br_client_method_param1=<ms> --br_client_addrs=127.0.0.1:32001,127.0.0.1:32004 "
+        "--br_client_node_type=store  # set specific nodes (store/index/document)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetRaftLogAppendSlow "
+        "--br_client_method_param1=<ms> --br_client_node_type=store,index  # filter by node type\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryRaftLogAppendSlow  "
+        "# query all store/index/document nodes\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryRaftLogAppendSlow "
+        "--br_client_node_type=store  # query all nodes of specified type (store/index/document, comma-separated)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryRaftLogAppendSlow "
+        "--br_client_node_type=store --br_client_addrs=127.0.0.1:32001,127.0.0.1:32004  "
+        "# query specified nodes by type and ip:port\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetStateMachineApplySlow "
+        "--br_client_method_param1=<ms>  # set all nodes; 0 to disable, >0 to inject sleep(ms)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetStateMachineApplySlow "
+        "--br_client_method_param1=<ms> --br_client_addrs=127.0.0.1:32001,127.0.0.1:32004 "
+        "--br_client_node_type=store  # set specific nodes (store/index/document)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=SetStateMachineApplySlow "
+        "--br_client_method_param1=<ms> --br_client_node_type=store,index  # filter by node type\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryStateMachineApplySlow  "
+        "# query all store/index/document nodes\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryStateMachineApplySlow "
+        "--br_client_node_type=store  # query all nodes of specified type (store/index/document, comma-separated)\n");
+    printf(
+        "./dingodb_br --br_type=tool --br_tool_type=client --br_client_method=QueryStateMachineApplySlow "
+        "--br_client_node_type=store --br_client_addrs=127.0.0.1:32001,127.0.0.1:32004  "
+        "# query specified nodes by type and ip:port\n");
 
     exit(-1);
   }
@@ -970,6 +1010,8 @@ int main(int argc, char* argv[]) {
     } else {  // client
       params.br_client_method = br::FLAGS_br_client_method;
       params.br_client_method_param1 = br::FLAGS_br_client_method_param1;
+      params.br_client_addrs = br::FLAGS_br_client_addrs;
+      params.br_client_node_type = br::FLAGS_br_client_node_type;
       tool = std::make_shared<br::Tool>(params);
     }
 

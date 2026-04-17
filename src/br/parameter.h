@@ -123,6 +123,8 @@ struct ToolParams {
   std::string br_diff_file2;
   std::string br_client_method;
   std::string br_client_method_param1;
+  std::string br_client_addrs;
+  std::string br_client_node_type;
 };
 
 struct ToolDumpParams {
@@ -143,6 +145,8 @@ struct ToolClientParams {
   std::string br_tool_type;
   std::string br_client_method;
   std::string br_client_method_param1;
+  std::string br_client_addrs;
+  std::string br_client_node_type;
 };
 
 // br tool type
@@ -162,6 +166,12 @@ DECLARE_string(br_client_method);
 
 // br client method param1
 DECLARE_string(br_client_method_param1);
+
+// br client target node addresses, comma-separated
+DECLARE_string(br_client_addrs);
+
+// br client node type: store / index / document (comma-separated)
+DECLARE_string(br_client_node_type);
 
 DECLARE_bool(br_backup_enable_get_job_list_check);
 

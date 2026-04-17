@@ -117,6 +117,14 @@ DEFINE_string(br_client_method, "", "br client method. default empty");
 // br client method param1
 DEFINE_string(br_client_method_param1, "", "br client method param1. default empty");
 
+// br client target node addresses, comma-separated, e.g. 127.0.0.1:32001,127.0.0.1:32004
+DEFINE_string(br_client_addrs, "", "br client target node addresses, comma-separated. used to operate on specific nodes");
+
+// br client node type: store / index / document (comma-separated)
+// When br_client_addrs is set: single type (store/index/document) identifying the service to call.
+// When br_client_addrs is empty: comma-separated list to filter which node types are operated on (default: all).
+DEFINE_string(br_client_node_type, "", "br client node type (store/index/document). comma-separated");
+
 DEFINE_bool(br_backup_enable_get_job_list_check, true, "br backup enable get job list check. default true");
 
 // br backup index must be exist

@@ -50,6 +50,8 @@ namespace dingodb {
 
 DECLARE_bool(region_enable_auto_split);
 DECLARE_bool(region_enable_auto_merge);
+DECLARE_int32(rocks_log_append_slow_ms);
+DECLARE_int32(store_state_machine_apply_slow_ms);
 
 Storage::Storage(std::shared_ptr<Engine> raft_engine, std::shared_ptr<Engine> mono_engine,
                  mvcc::TsProviderPtr ts_provider)
@@ -2065,6 +2067,10 @@ butil::Status Storage::ControlConfig(std::shared_ptr<Context> /*ctx*/,
       Helper::HandleBoolControlConfigVariable(variable, config, FLAGS_region_enable_auto_merge);
     } else if ("FLAGS_raft_sync" == variable.name()) {
       Helper::HandleBoolControlConfigVariable(variable, config, braft::FLAGS_raft_sync);
+    } else if ("FLAGS_rocks_log_append_slow_ms" == variable.name()) {
+      Helper::HandleInt32ControlConfigVariable(variable, config, FLAGS_rocks_log_append_slow_ms);
+    } else if ("FLAGS_store_state_machine_apply_slow_ms" == variable.name()) {
+      Helper::HandleInt32ControlConfigVariable(variable, config, FLAGS_store_state_machine_apply_slow_ms);
     } else {
       config.set_is_already_set(false);
       config.set_is_error_occurred(true);

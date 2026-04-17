@@ -67,6 +67,18 @@ class ToolClient : public std::enable_shared_from_this<ToolClient> {
   static butil::Status QueryRaftSync();
   static butil::Status CoreRaftSync(const std::string& type, const std::string& action);
 
+  static butil::Status SetRaftLogAppendSlow(const std::string& ms, const std::string& addrs,
+                                             const std::string& node_type);
+  static butil::Status QueryRaftLogAppendSlow(const std::string& addrs, const std::string& node_type);
+  static butil::Status CoreRaftLogAppendSlow(const std::string& value, const std::string& action,
+                                              const std::string& addrs, const std::string& node_type);
+
+  static butil::Status SetStateMachineApplySlow(const std::string& ms, const std::string& addrs,
+                                                 const std::string& node_type);
+  static butil::Status QueryStateMachineApplySlow(const std::string& addrs, const std::string& node_type);
+  static butil::Status CoreStateMachineApplySlow(const std::string& value, const std::string& action,
+                                                  const std::string& addrs, const std::string& node_type);
+
   ToolClientParams tool_client_params_;
 };
 

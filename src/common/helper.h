@@ -429,6 +429,9 @@ class Helper {
   static void HandleBoolControlConfigVariable(const pb::common::ControlConfigVariable& variable,
                                               pb::common::ControlConfigVariable& config, bool& gflags_var);
 
+  static void HandleInt32ControlConfigVariable(const pb::common::ControlConfigVariable& variable,
+                                               pb::common::ControlConfigVariable& config, int32_t& gflags_var);
+
   static size_t FindReEnd(const std::string& s, size_t start_pos);
   static std::string Base64Encode(const std::string& input);
   static std::string EncodeREContent(const std::string& input);

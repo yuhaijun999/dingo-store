@@ -52,6 +52,11 @@ DECLARE_bool(raft_sync);
 
 namespace dingodb {
 
+DEFINE_int32(rocks_log_append_slow_ms, 0,
+             "rocks log storage inject sleep(ms) into append_entry/append_entries to simulate slow disk write. "
+             "0 means disabled. Used for testing only.");
+BRPC_VALIDATE_GFLAG(rocks_log_append_slow_ms, brpc::NonNegativeInteger);
+
 namespace wal {
 
 const char kLogDataPrefix = 'D';
@@ -1489,6 +1494,12 @@ int64_t RocksLogStorageWrapper::get_term(const int64_t index) {
 
 // append entry to log
 int RocksLogStorageWrapper::append_entry(const braft::LogEntry* entry) {
+  if (BAIDU_UNLIKELY(FLAGS_rocks_log_append_slow_ms > 0)) {
+    DINGO_LOG(WARNING) << fmt::format("[raft.log][{}] inject slow disk write {}ms", region_id_,
+                                      FLAGS_rocks_log_append_slow_ms);
+    bthread_usleep(FLAGS_rocks_log_append_slow_ms * 1000LL);
+  }
+
   Mutation mutation;
   mutation.type = Mutation::Type::kAppendLogEntry;
   mutation.region_id = region_id_;
@@ -1517,6 +1528,12 @@ int RocksLogStorageWrapper::append_entry(const braft::LogEntry* entry) {
 
 // append entries to log and update IOMetric, return success append number
 int RocksLogStorageWrapper::append_entries(const std::vector<braft::LogEntry*>& entries, braft::IOMetric* metric) {
+  if (BAIDU_UNLIKELY(FLAGS_rocks_log_append_slow_ms > 0)) {
+    DINGO_LOG(WARNING) << fmt::format("[raft.log][{}] inject slow disk write {}ms (batch={})", region_id_,
+                                      FLAGS_rocks_log_append_slow_ms, entries.size());
+    bthread_usleep(FLAGS_rocks_log_append_slow_ms * 1000LL);
+  }
+
   Mutation mutation;
   mutation.type = Mutation::Type::kAppendLogEntry;
   mutation.region_id = region_id_;
