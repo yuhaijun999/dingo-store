@@ -208,7 +208,7 @@ class Constant {
   static constexpr float kMergeRatioDefaultValue = 0.2;
   static constexpr float kMergeKeysRatioDefaultValue = 0.2;
 
-  static const int32_t kRaftLogFallBehindThreshold = 1000;
+  static const int32_t kRaftLogFallBehindThreshold = 50000;
   static const int32_t kTransferLeaderRaftLogFallBehindThreshold = 16;
 
   static constexpr int64_t kLockVer = INT64_MAX;
