@@ -1722,12 +1722,14 @@ butil::Status Helper::ValidateRaftStatusForSplitMerge(std::shared_ptr<pb::common
 
   for (const auto& [peer, follower] : raft_status->stable_followers()) {
     if (follower.consecutive_error_times() > 0) {
-      return butil::Status(pb::error::EINTERNAL, "follower %s abnormal.", peer.c_str());
+      return butil::Status(pb::error::EINTERNAL, "follower %s abnormal, consecutive_error_times=%d.", peer.c_str(),
+                           follower.consecutive_error_times());
     }
 
     if (follower.next_index() + Constant::kRaftLogFallBehindThreshold < raft_status->last_index()) {
-      return butil::Status(pb::error::EINTERNAL, "Follower %s log fall behind exceed %d.", peer.c_str(),
-                           Constant::kRaftLogFallBehindThreshold);
+      return butil::Status(pb::error::EINTERNAL,
+                           "Follower %s log fall behind exceed %d, next_index=%ld, last_index=%ld.", peer.c_str(),
+                           Constant::kRaftLogFallBehindThreshold, follower.next_index(), raft_status->last_index());
     }
   }
 
