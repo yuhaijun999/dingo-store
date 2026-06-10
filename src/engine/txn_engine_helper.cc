@@ -76,6 +76,15 @@ DEFINE_bool(dingo_log_switch_txn_gc_detail, false, "txn gc detail log");
 DEFINE_bool(dingo_log_switch_backup_detail, false, "backup detail log");
 DEFINE_bool(enable_gc_task_tracker, true, "enable gc task tracker");
 
+// [GC-Tombstone baseline step-1] Switch for txn scan tombstone observability.
+// Default off (false): only when enabled do we publish the count of RocksDB tombstones skipped by
+// txnscan / the returned row count to bvar, to collect the "tombstones slow down scan" before-baseline.
+// Note: next_tombstone is only meaningful when enable_rocksdb_perf_metric is also on (otherwise
+// PerfContext is not collected and internal_delete_skipped_count stays 0).
+DEFINE_bool(txn_scan_tombstone_metric, false,
+            "enable txn scan tombstone bvar metric (dingo_txn_scan_next_tombstone / processed_keys); "
+            "next_tombstone also requires enable_rocksdb_perf_metric=true");
+
 DEFINE_int64(max_restore_data_memory_size, 10 * 1024 * 1024, "max restore data memory size");
 BRPC_VALIDATE_GFLAG(max_restore_data_memory_size, brpc::PositiveInteger);
 DEFINE_int64(max_restore_count, 32768, "max restore count");
@@ -89,6 +98,8 @@ DEFINE_validator(dingo_log_switch_txn_gc_detail, &PassBool);
 DEFINE_validator(dingo_log_switch_backup_detail, &PassBool);
 DEFINE_validator(enable_gc_task_tracker, &PassBool);
 DEFINE_validator(enable_rocksdb_perf_metric, &PassBool);
+// [GC-Tombstone baseline step-1] Allow toggling this bool at runtime via gflags (same validator as other bool flags).
+DEFINE_validator(txn_scan_tombstone_metric, &PassBool);
 
 DEFINE_int64(txn_iterator_elapse_time_threshold_ms, 5, "txn iterator elapse time ms threshold");
 
@@ -1488,6 +1499,16 @@ butil::Status TxnEngineHelper::BatchGet(std::shared_ptr<Context> ctx, RawEngineP
 
 bvar::LatencyRecorder g_txn_scan_latency("dingo_txn_scan");
 
+// [GC-Tombstone baseline step-1] Txn scan tombstone observability metrics (process-level adders).
+// g_txn_scan_next_tombstone: total number of RocksDB tombstones actually skipped during txnscan iteration
+//   (sourced from RocksDB PerfContext.internal_delete_skipped_count, collected by scan_perf_guard).
+// g_txn_scan_processed_keys: number of rows txnscan actually returned to the client (used as the denominator).
+// The next_tombstone/processed_keys ratio measures how much tombstones slow down scan; it is the baseline
+// for comparing the compaction-filter benefit later.
+// Only accumulated when FLAGS_txn_scan_tombstone_metric=true; queryable by metric name on the brpc /vars page.
+bvar::Adder<int64_t> g_txn_scan_next_tombstone("dingo_txn_scan_next_tombstone");
+bvar::Adder<int64_t> g_txn_scan_processed_keys("dingo_txn_scan_processed_keys");
+
 class TxnScanStreamState;
 using TxnScanStreamStatePtr = std::shared_ptr<TxnScanStreamState>;
 
@@ -1750,6 +1771,17 @@ butil::Status TxnEngineHelper::Scan(std::shared_ptr<Context> ctx, StreamPtr stre
     }
     tracker->RecordElapsedTime("txn_iterator_scan", Helper::TimestampUs() - valid_result_time,
                                iter->GetSkippedVersions(), scan_perf_guard.GetPerfContext());
+
+    // [GC-Tombstone baseline step-1] Txn scan tombstone observability: the scan loop has finished and
+    // scan_perf_guard is still in scope, so accumulate this RPC's skipped RocksDB tombstone count and
+    // returned row count into the process-level bvars. Off by default, zero extra cost.
+    // Reuse the existing scan_perf_guard (no new PerfGuard); internal_delete_skipped_count is non-zero only
+    // when enable_rocksdb_perf_metric=true. kvs (original mode) and entries (lock_collection mode) are
+    // mutually exclusive, so their sum is this RPC's returned row count.
+    if (FLAGS_txn_scan_tombstone_metric) {
+      g_txn_scan_next_tombstone << static_cast<int64_t>(scan_perf_guard.GetPerfContext().internal_delete_skipped_count);
+      g_txn_scan_processed_keys << static_cast<int64_t>(kvs.size() + entries.size());
+    }
 
     if (Helper::TimestampUs() - valid_result_time > FLAGS_txn_iterator_elapse_time_threshold_ms * 1000) {
       DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
