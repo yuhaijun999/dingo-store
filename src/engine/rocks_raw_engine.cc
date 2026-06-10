@@ -37,6 +37,7 @@
 #include "config/config_helper.h"
 #include "engine/raw_engine.h"
 #include "engine/snapshot.h"
+#include "engine/write_compaction_filter.h"
 #include "fmt/core.h"
 #include "gflags/gflags.h"
 #include "proto/common.pb.h"
@@ -894,6 +895,13 @@ static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnF
 
   rocksdb::TableFactory* table_factory = NewBlockBasedTableFactory(table_options);
   family_options.table_factory.reset(table_factory);
+
+  // [GC-Tombstone baseline step-2] Register the write CF compaction filter (default OFF via gflag).
+  // Only the txn write CF gets the filter; when gc_enable_compaction_filter is false this is a no-op
+  // and the CF options are byte-for-byte identical to before. The factory is stateless and shared.
+  if (FLAGS_gc_enable_compaction_filter && column_family->Name() == Constant::kTxnWriteCF) {
+    family_options.compaction_filter_factory = std::make_shared<WriteCompactionFilterFactory>();
+  }
 
   return family_options;
 }

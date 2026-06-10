@@ -42,6 +42,7 @@
 #include "engine/gc_safe_point.h"
 #include "engine/gc_task_tracker.h"
 #include "engine/rocks_raw_engine.h"
+#include "engine/write_compaction_filter.h"
 #include "fmt/core.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
@@ -6117,6 +6118,28 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
 
   std::map<int64_t, std::pair<bool, int64_t>> safe_point_ts_group;
   safe_point_ts_group = gc_safe_point_manager->GetAllGcFlagAndSafePointTs();
+
+  // [GC-Tombstone baseline step-2] Refresh the process-level safe_point shared with the write CF
+  // compaction filter. Baseline simplification: take tenant 0 (kDefaultTenantId) only, NOT the
+  // cross-tenant min (the full version restores min-safe_point). The safe_point is monotonically
+  // increasing (never lowered); gc_stop is mirrored so the filter stops reclaiming while GC is held.
+  {
+    auto it = safe_point_ts_group.find(Constant::kDefaultTenantId);
+    if (it != safe_point_ts_group.end()) {
+      const bool tenant0_gc_stop = it->second.first;
+      const int64_t tenant0_safe_point = it->second.second;
+      g_compaction_filter_gc_stop.store(tenant0_gc_stop, std::memory_order_release);
+      if (!tenant0_gc_stop && tenant0_safe_point > 0) {
+        int64_t prev = g_compaction_filter_safe_point.load(std::memory_order_acquire);
+        if (tenant0_safe_point > prev) {
+          g_compaction_filter_safe_point.store(tenant0_safe_point, std::memory_order_release);
+        }
+      }
+    } else {
+      // Tenant 0 not present this round: be conservative and stop the filter.
+      g_compaction_filter_gc_stop.store(true, std::memory_order_release);
+    }
+  }
 
   bool all_gc_stop = true;
   for (auto [tenant_id, safe_point_ts_pair] : safe_point_ts_group) {
