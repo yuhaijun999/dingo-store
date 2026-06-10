@@ -54,6 +54,16 @@
 namespace dingodb {
 DEFINE_bool(enable_rocksdb_sync, false, "enable rocksdb sync");
 
+// [GC-Tombstone baseline step-3] periodic_compaction_seconds for the txn write CF, used to feed cold
+// SSTs through the compaction filter (step-2) periodically. Semantics: 0 means "do not override
+// RocksDB's own default" (i.e. the feature is OFF and behavior is unchanged); a value > 0 enables it
+// and is used as the period in seconds. The full GC tombstone benefit needs this so that versions in
+// cold / no-longer-written regions still get evaporated by the filter. For perf testing set it to a
+// few minutes (e.g. --gc_periodic_compaction_seconds=300).
+DEFINE_int64(gc_periodic_compaction_seconds, 0,
+             "periodic_compaction_seconds for the txn write CF (0 = off / do not override RocksDB "
+             "default); feeds cold SSTs through the compaction filter");
+
 namespace rocks {
 
 ColumnFamily::ColumnFamily(const std::string& cf_name, const ColumnFamilyConfig& config,
@@ -901,6 +911,14 @@ static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnF
   // and the CF options are byte-for-byte identical to before. The factory is stateless and shared.
   if (FLAGS_gc_enable_compaction_filter && column_family->Name() == Constant::kTxnWriteCF) {
     family_options.compaction_filter_factory = std::make_shared<WriteCompactionFilterFactory>();
+  }
+
+  // [GC-Tombstone baseline step-3] Enable periodic compaction on the txn write CF so cold SSTs are
+  // re-compacted (and thus pass through the filter) periodically. Default 0 -> do not touch the option
+  // at all, keeping CF options byte-for-byte identical to before. Only the write CF is configured
+  // (the filter is only registered there; periodic on data CF would be pure write amplification).
+  if (FLAGS_gc_periodic_compaction_seconds > 0 && column_family->Name() == Constant::kTxnWriteCF) {
+    family_options.periodic_compaction_seconds = static_cast<uint64_t>(FLAGS_gc_periodic_compaction_seconds);
   }
 
   return family_options;
