@@ -104,6 +104,16 @@ DEFINE_int64(gc_active_compaction_min_interval_s, 3600,
 DEFINE_bool(gc_active_compaction_force_bottommost, false,
             "force active CompactRange down to the bottommost level (higher write amp, more thorough)");
 
+// [GC-Tombstone baseline step-6] Read-path SEEK_BOUND adaptive seek. Default OFF (pure Next() as today).
+// When on, while skipping the old versions of one user_key, after txn_scan_seek_bound Next() calls still
+// on the same user_key, jump past all remaining versions with a single Seek instead of linear Next().
+// IMPORTANT: this also speeds up scans on its own, so it MUST stay OFF when measuring the compaction
+// filter benefit (single-variable comparison).
+DEFINE_bool(txn_scan_adaptive_seek, false,
+            "enable adaptive seek in txn scan: after txn_scan_seek_bound Next() calls within one user_key, "
+            "Seek to the next user_key (default off; keep off when measuring filter benefit)");
+DEFINE_int64(txn_scan_seek_bound, 8, "max Next() calls within one user_key before switching to Seek");
+
 DEFINE_int64(max_restore_data_memory_size, 10 * 1024 * 1024, "max restore data memory size");
 BRPC_VALIDATE_GFLAG(max_restore_data_memory_size, brpc::PositiveInteger);
 DEFINE_int64(max_restore_count, 32768, "max restore count");
@@ -122,6 +132,8 @@ DEFINE_validator(txn_scan_tombstone_metric, &PassBool);
 // [GC-Tombstone baseline step-5] Runtime-toggleable bools for the active compaction hook.
 DEFINE_validator(gc_enable_active_compaction, &PassBool);
 DEFINE_validator(gc_active_compaction_force_bottommost, &PassBool);
+// [GC-Tombstone baseline step-6] Runtime-toggleable bool for adaptive seek.
+DEFINE_validator(txn_scan_adaptive_seek, &PassBool);
 
 DEFINE_int64(txn_iterator_elapse_time_threshold_ms, 5, "txn iterator elapse time ms threshold");
 
@@ -814,10 +826,45 @@ butil::Status TxnIterator::InnerNext() {
   }
 }
 
+// [GC-Tombstone baseline step-6] Count how often adaptive seek kicks in (a user_key had more than
+// txn_scan_seek_bound old versions to skip). Only updated when txn_scan_adaptive_seek is on. Defined
+// here (before GotoNextUserKeyInWriteIter) so it is in scope at the use site.
+bvar::Adder<int64_t> g_txn_scan_over_seek_bound("dingo_txn_scan_over_seek_bound");
+
 butil::Status TxnIterator::GotoNextUserKeyInWriteIter(std::shared_ptr<Iterator> write_iter, std::string prev_user_key,
                                                       std::string &last_write_key, int64_t &skipped_count) {
   int64_t local_skip = 0;
+  // [GC-Tombstone baseline step-6] Adaptive seek (default OFF). With txn_scan_adaptive_seek off this is
+  // byte-for-byte the original pure-Next() loop below. With it on, after txn_scan_seek_bound Next() calls
+  // still on the same user_key we Seek past all remaining versions in one step. did_seek bounds it to a
+  // single Seek per call so forward progress is always guaranteed.
+  const bool adaptive_seek = FLAGS_txn_scan_adaptive_seek;
+  const int64_t seek_bound = FLAGS_txn_scan_seek_bound;
+  bool did_seek = false;
   while (write_iter->Valid()) {
+    if (adaptive_seek && !did_seek && seek_bound > 0 && local_skip >= seek_bound) {
+      did_seek = true;
+      g_txn_scan_over_seek_bound << 1;
+      // EncodeKey(prev_user_key, 0): with descending ts encoding, ts=0 maps to the largest possible
+      // suffix, so this target is greater than every real version of prev_user_key (commit_ts is always
+      // > 0) and less than the first key of the next user_key. Seek therefore lands on the next user_key
+      // (or the end), never overshooting it.
+      write_iter->Seek(mvcc::Codec::EncodeKey(prev_user_key, 0));
+      if (write_iter->Valid()) {
+        int64_t commit_ts;
+        auto ret = mvcc::Codec::DecodeKey(write_iter->Key(), last_write_key, commit_ts);
+        if (!ret) {
+          DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, write_iter->key: "
+                           << Helper::StringToHex(write_iter->Key());
+        }
+        if (last_write_key > prev_user_key) {
+          break;  // reached the next user_key (the expected outcome)
+        }
+        // Defensive: if (unexpectedly) still on prev_user_key, fall through to plain Next() below
+        // (did_seek prevents another Seek), which guarantees progress.
+      }
+      continue;
+    }
     write_iter->Next();
     local_skip++;
     if (write_iter->Valid()) {
