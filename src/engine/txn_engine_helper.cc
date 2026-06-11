@@ -86,6 +86,24 @@ DEFINE_bool(txn_scan_tombstone_metric, false,
             "enable txn scan tombstone bvar metric (dingo_txn_scan_next_tombstone / processed_keys); "
             "next_tombstone also requires enable_rocksdb_perf_metric=true");
 
+// [GC-Tombstone baseline step-5] L1 active compaction after raft GC. ALL OFF / conservative by default.
+// After a region's raft GC, actively CompactRange its write CF to feed the compaction filter so cold
+// data is reclaimed in a timely way. CompactRange is a SYNCHRONOUS BLOCKING call, so the hook lives in
+// the GC poll thread and MUST be throttled (master switch + down-throttle + per-round time budget +
+// per-round cap + per-region min interval) to avoid stalling safe_point advancement.
+DEFINE_bool(gc_enable_active_compaction, false,
+            "L1 master switch: after raft GC of a region, actively CompactRange its write CF to feed the "
+            "compaction filter (default off, hot-rollback gate)");
+DEFINE_int64(gc_active_compaction_every_n_rounds, 5,
+             "do active compaction once every N RegularDoGcHandler rounds (down-throttle)");
+DEFINE_int64(gc_active_compaction_round_budget_ms, 30000,
+             "per-round total time budget (ms) for active compaction; stop issuing once used up");
+DEFINE_int64(gc_active_compaction_max_per_round, 16, "max number of CompactRange calls issued per GC round");
+DEFINE_int64(gc_active_compaction_min_interval_s, 3600,
+             "min interval (s) between two active compactions of the same region");
+DEFINE_bool(gc_active_compaction_force_bottommost, false,
+            "force active CompactRange down to the bottommost level (higher write amp, more thorough)");
+
 DEFINE_int64(max_restore_data_memory_size, 10 * 1024 * 1024, "max restore data memory size");
 BRPC_VALIDATE_GFLAG(max_restore_data_memory_size, brpc::PositiveInteger);
 DEFINE_int64(max_restore_count, 32768, "max restore count");
@@ -101,6 +119,9 @@ DEFINE_validator(enable_gc_task_tracker, &PassBool);
 DEFINE_validator(enable_rocksdb_perf_metric, &PassBool);
 // [GC-Tombstone baseline step-1] Allow toggling this bool at runtime via gflags (same validator as other bool flags).
 DEFINE_validator(txn_scan_tombstone_metric, &PassBool);
+// [GC-Tombstone baseline step-5] Runtime-toggleable bools for the active compaction hook.
+DEFINE_validator(gc_enable_active_compaction, &PassBool);
+DEFINE_validator(gc_active_compaction_force_bottommost, &PassBool);
 
 DEFINE_int64(txn_iterator_elapse_time_threshold_ms, 5, "txn iterator elapse time ms threshold");
 
@@ -6099,6 +6120,75 @@ void TxnEngineHelper::RegularUpdateSafePointTsHandler(void * /*arg*/) {
 #endif
 #undef ENABLE_TXN_GC_REMEMBER_LAST_ACCOMPLISHED_SAFE_POINT_TS
 
+namespace {
+
+// [GC-Tombstone baseline step-5] Per-region active-compaction limiter state.
+// RegularDoGcHandler is single-instance (AtomicGuard g_regular_do_gc_handler_running) and this state is
+// only touched from within it, so no lock is needed. The round counter is atomic only out of caution.
+struct ActiveCompactionRegionState {
+  int64_t last_compaction_time_ms = 0;     // when we last issued CompactRange for this region
+  int64_t last_compaction_safe_point = 0;  // the safe_point used at that compaction
+};
+std::atomic<int64_t> g_active_compaction_round_counter{0};
+std::map<int64_t, ActiveCompactionRegionState> g_active_compaction_region_state;  // region_id -> state
+
+// Per-region active compaction after a region's raft GC, with throttling. Returns true if a CompactRange
+// was actually issued. Round-level gating (every_n_rounds / time budget / per-round cap) is computed by
+// the caller and passed in; this function applies per-region gating (min interval + safe_point advanced)
+// then issues a single SYNCHRONOUS, BLOCKING CompactRange on the write CF.
+bool MaybeActiveCompactAfterGc(const RawEnginePtr &raw_engine, int64_t region_id,
+                               const std::string &region_start_key, const std::string &region_end_key,
+                               int64_t safe_point_ts, bool do_this_round, int64_t round_deadline_ms,
+                               int &issued_this_round) {
+  if (!do_this_round) {
+    return false;  // down-throttled this round
+  }
+  if (issued_this_round >= FLAGS_gc_active_compaction_max_per_round) {
+    return false;  // per-round cap reached
+  }
+  // Per-round time budget. NOTE: this can only block the NEXT CompactRange; it cannot interrupt the one
+  // currently blocking (a synchronous CompactRange is uninterruptible here). Default-off allows hot rollback.
+  if (Helper::TimestampMs() >= round_deadline_ms) {
+    return false;
+  }
+
+  const int64_t now_ms = Helper::TimestampMs();
+  auto &state = g_active_compaction_region_state[region_id];  // default {0, 0}
+  // Same-region minimum interval.
+  if (state.last_compaction_time_ms != 0 &&
+      now_ms - state.last_compaction_time_ms < FLAGS_gc_active_compaction_min_interval_s * 1000) {
+    return false;
+  }
+  // Only act when the safe_point has advanced since this region's last compaction; otherwise the same
+  // versions would be re-compacted every round for nothing.
+  if (safe_point_ts <= state.last_compaction_safe_point) {
+    return false;
+  }
+  // [L2 TODO] check_need_gc via GetPropertiesOfTablesInRange could gate "no garbage" regions here.
+
+  // Encode the region bounds into physical keys. CAUTION: EncodeBytes("") returns a non-empty 9-byte key,
+  // so an empty bound (first / last region) must be passed through as an empty string, which CompactRange
+  // turns into nullptr (open bound). Never EncodeBytes an empty key.
+  const std::string enc_start =
+      region_start_key.empty() ? std::string() : mvcc::Codec::EncodeBytes(region_start_key);
+  const std::string enc_end = region_end_key.empty() ? std::string() : mvcc::Codec::EncodeBytes(region_end_key);
+
+  // Record the attempt BEFORE the blocking call so the interval is measured from the start.
+  state.last_compaction_time_ms = now_ms;
+  state.last_compaction_safe_point = safe_point_ts;
+  ++issued_this_round;
+
+  auto status = raw_engine->CompactRange(Constant::kTxnWriteCF, enc_start, enc_end,
+                                         FLAGS_gc_active_compaction_force_bottommost);
+  if (!status.ok()) {
+    DINGO_LOG(WARNING) << fmt::format("[txn_gc][region({})] active CompactRange failed: {}", region_id,
+                                      status.error_cstr());
+  }
+  return true;
+}
+
+}  // namespace
+
 void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
   static std::atomic<bool> g_regular_do_gc_handler_running(false);
 
@@ -6260,6 +6350,17 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
     }
   }
 
+  // [GC-Tombstone baseline step-5] Per-round gating for active compaction (single-instance, no lock).
+  // do_active_compaction_this_round / round_deadline_ms / issued_this_round span the whole region loop.
+  const int64_t active_compaction_round =
+      g_active_compaction_round_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  const int64_t active_compaction_every_n =
+      FLAGS_gc_active_compaction_every_n_rounds > 0 ? FLAGS_gc_active_compaction_every_n_rounds : 1;
+  const bool do_active_compaction_this_round =
+      FLAGS_gc_enable_active_compaction && (active_compaction_round % active_compaction_every_n == 0);
+  const int64_t round_deadline_ms = Helper::TimestampMs() + FLAGS_gc_active_compaction_round_budget_ms;
+  int issued_this_round = 0;
+
   // Caution !!!
   // We will not use a snapshot globally because it will affect other region compaction.
   for (const auto &region_ptr : leader_region_ptrs) {
@@ -6331,6 +6432,19 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
                          tenant_id, ctx->RegionId(), Helper::StringToHex(region_ptr->Range().start_key()),
                          Helper::StringToHex(region_ptr->Range().end_key()));
       continue;
+    }
+
+    // [GC-Tombstone baseline step-5] L1 active compaction hook: this region's raft GC just succeeded and
+    // GC is not stopped, so actively compact its write CF range to feed the compaction filter. Fully
+    // gated and throttled; with gc_enable_active_compaction off (default) this whole block is a no-op.
+    if (FLAGS_gc_enable_active_compaction && status.ok()) {
+      RawEnginePtr active_compaction_raw_engine =
+          storage->GetRawEngine(ctx->StoreEngineType(), ctx->RawEngineType());
+      if (active_compaction_raw_engine != nullptr) {
+        MaybeActiveCompactAfterGc(active_compaction_raw_engine, region_ptr->Id(),
+                                  region_ptr->Range().start_key(), region_ptr->Range().end_key(), safe_point_ts,
+                                  do_active_compaction_this_round, round_deadline_ms, issued_this_round);
+      }
     }
 
 #if defined(ENABLE_TXN_GC_REMEMBER_LAST_ACCOMPLISHED_SAFE_POINT_TS)
