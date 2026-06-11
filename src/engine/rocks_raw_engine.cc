@@ -64,6 +64,15 @@ DEFINE_int64(gc_periodic_compaction_seconds, 0,
              "periodic_compaction_seconds for the txn write CF (0 = off / do not override RocksDB "
              "default); feeds cold SSTs through the compaction filter");
 
+// [GC-Tombstone baseline step-7] Use DeleteFilesInRange (file-level SST drop, 0 range tombstone) plus a
+// per-key fallback for large-range deletes (drop region / TxnDeleteRange / snapshot cleanup), instead of
+// RocksDB DeleteRange (which writes a range tombstone that slows every scan crossing the range). Default
+// OFF (false) = keep the current DeleteRange behavior byte-for-byte. The lock CF ALWAYS uses DeleteRange
+// regardless of this flag (a stray file-level drop of lock records is unsafe -- see DoDeleteRangeOneCf).
+DEFINE_bool(gc_use_delete_files_in_range, false,
+            "use DeleteFilesInRange + per-key fallback for large-range deletes (false = keep DeleteRange); "
+            "the lock CF always uses DeleteRange regardless of this flag");
+
 namespace rocks {
 
 ColumnFamily::ColumnFamily(const std::string& cf_name, const ColumnFamilyConfig& config,
@@ -683,6 +692,93 @@ butil::Status Writer::KvDelete(const std::string& cf_name, const std::string& ke
   return butil::Status();
 }
 
+// [GC-Tombstone baseline step-7] Delete one (cf, range). Pre-conditions: the range is already validated
+// (non-empty start/end, start < end) and start/end are already-encoded physical keys. The range is
+// right-open [start, end).
+//
+// When gc_use_delete_files_in_range is OFF, or the CF is the lock CF, this keeps the original behavior
+// (a single DeleteRange committed in a WriteBatch). Otherwise it uses DeleteFilesInRange (file-level
+// whole-SST drop, no range tombstone) plus a per-key fallback that scans the leftover keys -- from L0
+// files and partially-overlapping SSTs, which DeleteFilesInRange does NOT remove -- and point-deletes
+// them, so the range ends up fully cleared.
+//
+// The lock CF is intentionally excluded: its records carry transaction locks, and a file-level drop
+// (which leaves L0 / partial-overlap residue until the fallback runs) is unsafe for lock correctness, so
+// the lock CF always uses DeleteRange regardless of the flag.
+static butil::Status DoDeleteRangeOneCf(const std::shared_ptr<rocksdb::DB>& db, rocksdb::ColumnFamilyHandle* handle,
+                                        const std::string& cf_name, const pb::common::Range& range) {
+  rocksdb::WriteOptions write_options;
+  write_options.sync = FLAGS_enable_rocksdb_sync;
+
+  // Original path: DeleteRange. Used when the feature is off, or for the lock CF (always).
+  if (!FLAGS_gc_use_delete_files_in_range || cf_name == Constant::kTxnLockCF) {
+    rocksdb::WriteBatch batch;
+    rocksdb::Status s = batch.DeleteRange(handle, range.start_key(), range.end_key());
+    if (!s.ok()) {
+      DINGO_LOG(ERROR) << fmt::format("[rocksdb] delete range failed, error: {}.", s.ToString());
+      return butil::Status(pb::error::EINTERNAL, "Internal delete range error");
+    }
+    s = db->Write(write_options, &batch);
+    if (!s.ok()) {
+      DINGO_LOG(ERROR) << fmt::format("[rocksdb] write failed, error: {}.", s.ToString());
+      return butil::Status(pb::error::EINTERNAL, "Internal write error");
+    }
+    return butil::Status();
+  }
+
+  // DeleteFilesInRange path (non-lock CF + feature on).
+  const std::string& start = range.start_key();
+  const std::string& end = range.end_key();
+  rocksdb::Slice begin_slice(start);
+  rocksdb::Slice end_slice(end);
+
+  // (a) File-level delete: drops only the SSTs that fall entirely inside [start, end). include_end=false
+  // keeps it consistent with the right-open range semantics. It leaves L0 files and partially-overlapping
+  // SSTs untouched -- those are cleaned up by the per-key fallback below.
+  rocksdb::Status s =
+      rocksdb::DeleteFilesInRange(db.get(), handle, &begin_slice, &end_slice, /*include_end=*/false);
+  if (!s.ok()) {
+    DINGO_LOG(ERROR) << fmt::format("[rocksdb] delete files in range failed, cf: {}, error: {}.", cf_name,
+                                    s.ToString());
+    return butil::Status(pb::error::EINTERNAL, "Internal delete files in range error");
+  }
+
+  // (b) Per-key fallback: scan whatever keys are still visible in [start, end) (L0 residue, partial-overlap
+  // SST residue, memtable) and point-delete them so the range is fully cleared. iterate_upper_bound
+  // enforces the right-open end (key < end), matching include_end=false above; Seek(begin) includes start.
+  rocksdb::ReadOptions read_options;
+  read_options.fill_cache = false;  // one-shot bulk scan, do not pollute the block cache
+  rocksdb::Slice upper_bound_slice(end);
+  read_options.iterate_upper_bound = &upper_bound_slice;
+
+  rocksdb::WriteBatch del_batch;
+  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(read_options, handle));
+  for (it->Seek(begin_slice); it->Valid(); it->Next()) {
+    rocksdb::Status ds = del_batch.Delete(handle, it->key());
+    if (!ds.ok()) {
+      DINGO_LOG(ERROR) << fmt::format("[rocksdb] fallback delete failed, cf: {}, error: {}.", cf_name,
+                                      ds.ToString());
+      return butil::Status(pb::error::EINTERNAL, "Internal delete range error");
+    }
+  }
+  if (!it->status().ok()) {
+    DINGO_LOG(ERROR) << fmt::format("[rocksdb] fallback iterate failed, cf: {}, error: {}.", cf_name,
+                                    it->status().ToString());
+    return butil::Status(pb::error::EINTERNAL, "Internal iterate error");
+  }
+
+  if (del_batch.Count() > 0) {
+    s = db->Write(write_options, &del_batch);
+    if (!s.ok()) {
+      DINGO_LOG(ERROR) << fmt::format("[rocksdb] fallback write failed, cf: {}, error: {}.", cf_name,
+                                      s.ToString());
+      return butil::Status(pb::error::EINTERNAL, "Internal write error");
+    }
+  }
+
+  return butil::Status();
+}
+
 butil::Status Writer::KvDeleteRange(const std::string& cf_name, const pb::common::Range& range) {
   if (range.start_key().empty() || range.end_key().empty()) {
     return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "range is empty");
@@ -691,26 +787,16 @@ butil::Status Writer::KvDeleteRange(const std::string& cf_name, const pb::common
     return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "range is wrong");
   }
 
-  rocksdb::WriteBatch batch;
-  rocksdb::Status s = batch.DeleteRange(GetColumnFamily(cf_name)->GetHandle(), range.start_key(), range.end_key());
-  if (!s.ok()) {
-    DINGO_LOG(ERROR) << fmt::format("[rocksdb] delete range failed, error: {}.", s.ToString());
-    return butil::Status(pb::error::EINTERNAL, "Internal delete range error");
-  }
-  rocksdb::WriteOptions write_options;
-  write_options.sync = FLAGS_enable_rocksdb_sync;
-
-  s = GetDB()->Write(write_options, &batch);
-  if (!s.ok()) {
-    DINGO_LOG(ERROR) << fmt::format("[rocksdb] write failed, error: {}.", s.ToString());
-    return butil::Status(pb::error::EINTERNAL, "Internal write error");
-  }
-
-  return butil::Status();
+  return DoDeleteRangeOneCf(GetDB(), GetColumnFamily(cf_name)->GetHandle(), cf_name, range);
 }
 
 butil::Status Writer::KvBatchDeleteRange(const std::map<std::string, std::vector<pb::common::Range>>& range_with_cfs) {
-  rocksdb::WriteBatch batch;
+  // Note: with gc_use_delete_files_in_range on, DeleteFilesInRange is a direct DB operation that cannot be
+  // batched into a single WriteBatch, so each (cf, range) is committed independently here (the previous
+  // single-atomic-WriteBatch grouping is dropped). Callers (drop region / TxnDeleteRange / snapshot
+  // cleanup) clear whole regions and do not rely on cross-CF atomicity; the operations are idempotent and
+  // re-driven by raft apply / region retry. With the flag off, the visible effect matches the original
+  // per-range DeleteRange (only the commit boundary changes).
   for (const auto& [cf_name, ranges] : range_with_cfs) {
     auto column_family = GetColumnFamily(cf_name);
     for (const auto& range : ranges) {
@@ -721,20 +807,11 @@ butil::Status Writer::KvBatchDeleteRange(const std::map<std::string, std::vector
         return butil::Status(pb::error::EILLEGAL_PARAMTETERS, "range is wrong");
       }
 
-      rocksdb::Status s = batch.DeleteRange(column_family->GetHandle(), range.start_key(), range.end_key());
-      if (!s.ok()) {
-        DINGO_LOG(ERROR) << fmt::format("[rocksdb] delete range failed, error: {}.", s.ToString());
-        return butil::Status(pb::error::EINTERNAL, "Internal delete range error");
+      auto status = DoDeleteRangeOneCf(GetDB(), column_family->GetHandle(), cf_name, range);
+      if (!status.ok()) {
+        return status;
       }
     }
-  }
-  rocksdb::WriteOptions write_options;
-  write_options.sync = FLAGS_enable_rocksdb_sync;
-
-  rocksdb::Status s = GetDB()->Write(write_options, &batch);
-  if (!s.ok()) {
-    DINGO_LOG(ERROR) << fmt::format("[rocksdb] write failed, error: {}.", s.ToString());
-    return butil::Status(pb::error::EINTERNAL, "Internal write error");
   }
 
   return butil::Status();
