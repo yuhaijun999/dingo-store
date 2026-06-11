@@ -288,6 +288,9 @@ class RocksRawEngine : public RawEngine {
 
   void Flush(const std::string& cf_name) override;
   butil::Status Compact(const std::string& cf_name) override;
+  // [GC-Tombstone baseline step-4] Range-scoped manual compaction (see RawEngine::CompactRange).
+  butil::Status CompactRange(const std::string& cf_name, const std::string& start_key, const std::string& end_key,
+                             bool force_bottommost) override;
 
   std::vector<int64_t> GetApproximateSizes(const std::string& cf_name, std::vector<pb::common::Range>& ranges) override;
 

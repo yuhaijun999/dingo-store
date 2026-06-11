@@ -1198,6 +1198,45 @@ butil::Status RocksRawEngine::Compact(const std::string& cf_name) {
   return butil::Status();
 }
 
+// [GC-Tombstone baseline step-4] Manual compaction over a single CF key range. Used by the active
+// compaction driver (step 5) to feed cold SSTs of a region through the registered compaction filter.
+butil::Status RocksRawEngine::CompactRange(const std::string& cf_name, const std::string& start_key,
+                                           const std::string& end_key, bool force_bottommost) {
+  if (db_ == nullptr) {
+    return butil::Status(pb::error::EINTERNAL, "db is null");
+  }
+
+  rocksdb::CompactRangeOptions options;
+  // Unlike the legacy Compact() (which uses exclusive=true / allow_write_stall=true for a debug-style
+  // forced full-CF compaction), the active driver runs periodically in the background, so it must NOT
+  // block background compactions and must yield when the DB is near a write stall.
+  options.exclusive_manual_compaction = false;
+  options.allow_write_stall = false;
+  options.max_subcompactions = 1;
+  // With the write CF filter registered, kIfHaveCompactionFilter already pulls in the bottommost level
+  // (where versions are physically reclaimed). kForce compacts the bottommost every time at the cost of
+  // large write amplification, used only when the caller explicitly asks.
+  options.bottommost_level_compaction = force_bottommost
+                                            ? rocksdb::BottommostLevelCompaction::kForce
+                                            : rocksdb::BottommostLevelCompaction::kIfHaveCompactionFilter;
+
+  // start_key / end_key are already-encoded (EncodeBytes) physical keys; an empty string means an open
+  // bound (nullptr) on that side. The Slice objects must outlive the CompactRange call.
+  rocksdb::Slice begin_slice(start_key);
+  rocksdb::Slice end_slice(end_key);
+  const rocksdb::Slice* begin = start_key.empty() ? nullptr : &begin_slice;
+  const rocksdb::Slice* end = end_key.empty() ? nullptr : &end_slice;
+
+  auto status = db_->CompactRange(options, GetColumnFamily(cf_name)->GetHandle(), begin, end);
+  if (!status.ok()) {
+    DINGO_LOG(ERROR) << fmt::format("[rocksdb] compact range failed, column family {}, status {}", cf_name,
+                                    status.ToString());
+    return butil::Status(pb::error::EINTERNAL, "CompactRange column family %s failed", cf_name.c_str());
+  }
+
+  return butil::Status();
+}
+
 void RocksRawEngine::Destroy() { rocksdb::DestroyDB(db_path_, rocksdb::Options()); }
 
 void RocksRawEngine::Close() {

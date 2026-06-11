@@ -137,6 +137,17 @@ class RawEngine : public std::enable_shared_from_this<RawEngine> {
   virtual void Flush(const std::string& cf_name) = 0;
   virtual butil::Status Compact(const std::string& cf_name) = 0;
 
+  // [GC-Tombstone baseline step-4] Manual compaction over a single CF key range, used by the active
+  // compaction driver (step 5) to feed cold SSTs of a region through the compaction filter.
+  // start_key / end_key are already-encoded (EncodeBytes) physical keys; an empty string means an
+  // open bound (nullptr) on that side. Intentionally NON-pure-virtual with a NotSupported default so
+  // that only RocksRawEngine has to override it (xdprocks / bdb / mem fall back to the default and
+  // still compile). The legacy Compact(cf_name) above is left untouched.
+  virtual butil::Status CompactRange(const std::string& /*cf_name*/, const std::string& /*start_key*/,
+                                     const std::string& /*end_key*/, bool /*force_bottommost*/) {
+    return butil::Status(pb::error::ENOT_SUPPORT, "CompactRange is not supported by this engine");
+  }
+
  protected:
   RawEngine() = default;
 };
