@@ -1016,6 +1016,11 @@ rocksdb::DB* RocksRawEngine::InitDB(const std::string& db_path, rocks::ColumnFam
   db_options.max_background_jobs = ConfigHelper::GetRocksDBBackgroundThreadNum();
   db_options.max_subcompactions = db_options.max_background_jobs / 4 * 3;
   db_options.stats_dump_period_sec = ConfigHelper::GetRocksDBStatsDumpPeriodSec();
+  // Cap the info LOG (diagnostic LOG file) so it does not grow unbounded (the periodic stats dump above
+  // keeps appending to it even on an idle DB). Configurable via the role yaml; defaults to 256MB x 10.
+  db_options.max_log_file_size = ConfigHelper::GetRocksDBMaxLogFileSize();
+  db_options.keep_log_file_num = ConfigHelper::GetRocksDBKeepLogFileNum();
+  db_options.log_file_time_to_roll = ConfigHelper::GetRocksDBLogFileTimeToRollSec();
   db_options.use_direct_io_for_flush_and_compaction = true;
   db_options.statistics=rocksdb::CreateDBStatistics();
 

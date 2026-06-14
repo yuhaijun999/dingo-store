@@ -67,6 +67,15 @@ DEFINE_int32(rocks_log_write_wait_time_ms, 2, "rocks log storage write wait time
 BRPC_VALIDATE_GFLAG(rocks_log_write_wait_time_ms, brpc::PositiveInteger);
 
 DEFINE_int32(rocks_log_recycle_file_num, 8, "rocks log storage recycle log file num");
+
+// Info LOG (the human-readable diagnostic LOG file, NOT the WAL) roll settings for the raft log
+// storage RocksDB. Without these the LOG grows unbounded (worsened by the periodic stats dump).
+// Defaults cap it at 256MB x 10 (~2.5GB). max_log_file_size=0 would mean RocksDB's unbounded default.
+DEFINE_int64(rocks_log_max_log_file_size, 256L * 1024 * 1024,
+             "rocks log storage info LOG file size limit in bytes (0 = RocksDB default, no size roll)");
+DEFINE_int32(rocks_log_keep_log_file_num, 10, "rocks log storage max number of info LOG files to keep");
+DEFINE_int32(rocks_log_file_time_to_roll_s, 0,
+             "rocks log storage info LOG time-based roll period in seconds (0 = disabled)");
 BRPC_VALIDATE_GFLAG(rocks_log_recycle_file_num, brpc::PositiveInteger);
 
 DEFINE_bool(rocks_log_enable_get_term_cache, false, "rocks log storage enable get term cache. default false");
@@ -463,6 +472,10 @@ bool RocksLogStorage::InitRocksDB() {
   db_options.max_subcompactions = 6;
   db_options.stats_dump_period_sec = 60;
   db_options.recycle_log_file_num = FLAGS_rocks_log_recycle_file_num;
+  // Cap the info LOG (diagnostic LOG file) so it does not grow unbounded.
+  db_options.max_log_file_size = FLAGS_rocks_log_max_log_file_size;
+  db_options.keep_log_file_num = FLAGS_rocks_log_keep_log_file_num;
+  db_options.log_file_time_to_roll = FLAGS_rocks_log_file_time_to_roll_s;
   db_options.use_direct_io_for_flush_and_compaction = true;
   db_options.manual_wal_flush = false;
 

@@ -38,6 +38,11 @@ class ConfigHelper {
 
   static int GetRocksDBBackgroundThreadNum();
   static int GetRocksDBStatsDumpPeriodSec();
+  // Info LOG (diagnostic LOG file, not WAL) roll settings, read from the role yaml config
+  // (store.max_log_file_size / store.keep_log_file_num / store.log_file_time_to_roll_s).
+  static int64_t GetRocksDBMaxLogFileSize();
+  static int GetRocksDBKeepLogFileNum();
+  static int GetRocksDBLogFileTimeToRollSec();
 
   static uint32_t GetLeaderNumWeight();
 

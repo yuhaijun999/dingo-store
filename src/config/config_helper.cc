@@ -232,6 +232,39 @@ int ConfigHelper::GetRocksDBStatsDumpPeriodSec() {
   return (num <= 0) ? Constant::kStatsDumpPeriodSecDefault : num;
 }
 
+int64_t ConfigHelper::GetRocksDBMaxLogFileSize() {
+  auto config = ConfigManager::GetInstance().GetRoleConfig();
+  if (config == nullptr) {
+    return Constant::kRocksdbMaxLogFileSizeDefault;
+  }
+
+  // Bytes. Absent or <= 0 falls back to the capped default (so a missing/zero config never means
+  // "unbounded"); to effectively disable rolling, set a very large value.
+  int64_t size = config->GetInt64("store.max_log_file_size");
+  return (size <= 0) ? Constant::kRocksdbMaxLogFileSizeDefault : size;
+}
+
+int ConfigHelper::GetRocksDBKeepLogFileNum() {
+  auto config = ConfigManager::GetInstance().GetRoleConfig();
+  if (config == nullptr) {
+    return Constant::kRocksdbKeepLogFileNumDefault;
+  }
+
+  int num = config->GetInt("store.keep_log_file_num");
+  return (num <= 0) ? Constant::kRocksdbKeepLogFileNumDefault : num;
+}
+
+int ConfigHelper::GetRocksDBLogFileTimeToRollSec() {
+  auto config = ConfigManager::GetInstance().GetRoleConfig();
+  if (config == nullptr) {
+    return Constant::kRocksdbLogFileTimeToRollSecDefault;
+  }
+
+  // Seconds. Default 0 = time-based roll disabled (size-based roll still applies).
+  int num = config->GetInt("store.log_file_time_to_roll_s");
+  return (num <= 0) ? Constant::kRocksdbLogFileTimeToRollSecDefault : num;
+}
+
 uint32_t ConfigHelper::GetLeaderNumWeight() {
   auto config = ConfigManager::GetInstance().GetRoleConfig();
   if (config == nullptr) {

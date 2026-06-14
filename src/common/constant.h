@@ -134,6 +134,12 @@ class Constant {
 
   static const int kRocksdbBackgroundThreadNumDefault = 16;
   static const int kStatsDumpPeriodSecDefault = 600;
+  // Info LOG (the human-readable diagnostic LOG file, NOT the WAL) roll defaults. RocksDB's own
+  // default is max_log_file_size=0 (one LOG that only rotates on reopen, i.e. grows unbounded). We
+  // cap it: each LOG file <= 256MB and keep at most 10 rolled files (~2.5GB total). 0 disables roll.
+  static const int64_t kRocksdbMaxLogFileSizeDefault = 256L * 1024 * 1024;
+  static const int kRocksdbKeepLogFileNumDefault = 10;
+  static const int kRocksdbLogFileTimeToRollSecDefault = 0;
 
   // scan config
   inline static const std::string kStoreScan = "store.scan";
