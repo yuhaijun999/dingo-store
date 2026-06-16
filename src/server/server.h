@@ -161,6 +161,10 @@ class Server {
   std::shared_ptr<RawEngine> GetRawEngine(pb::common::RawEngine type);
   std::shared_ptr<Engine> GetEngine(pb::common::StorageEngine store_engine_type);
 
+  // The main store RocksRawEngine, always set after InitRocksRawEngine (unlike GetRawEngine this does
+  // not require raft_engine_). Used for periodic RocksDB statistics metric collection.
+  std::shared_ptr<RocksRawEngine> GetRocksRawEngine() { return rocks_raw_engine_; }
+
   std::shared_ptr<RaftStoreEngine> GetRaftStoreEngine();
   std::shared_ptr<MonoStoreEngine> GetMonoStoreEngine();
 

@@ -226,6 +226,12 @@ class RocksLogStorage {
   std::map<int64_t, LogIndexMeta> GetLogIndexMeta(const std::vector<int64_t>& region_ids, bool is_actual);
   void PrintLogIndexMeta();
 
+  // RocksDB Statistics object created in InitRocksDB. Returned for periodic metric collection;
+  // nullptr before the DB is opened.
+  std::shared_ptr<rocksdb::Statistics> GetStatistics() {
+    return db_ != nullptr ? db_->GetDBOptions().statistics : nullptr;
+  }
+
  private:
   bool InitExecutionQueue();
   bool CloseExecutionQueue();

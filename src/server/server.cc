@@ -46,6 +46,7 @@
 #include "common/stream.h"
 #include "coordinator/balance_leader.h"
 #include "engine/mono_store_engine.h"
+#include "metrics/rocksdb_statistics_metrics.h"
 #include "engine/txn_engine_helper.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -81,6 +82,8 @@ DEFINE_int32(server_metrics_collect_interval_s, 300, "metrics collect interval s
 DEFINE_int32(server_store_metrics_collect_interval_s, 30, "store metrics collect interval seconds");
 DEFINE_int32(server_approximate_size_metrics_collect_interval_s, 300,
              "approximate size metrics collect interval seconds");
+DEFINE_int32(rocksdb_statistics_metric_collect_interval_s, 60,
+             "rocksdb statistics metric collect interval seconds");
 DEFINE_int32(scan_scan_interval_s, 30, "scan interval seconds");
 DEFINE_int32(scanv2_scan_interval_s, 30, "scan interval seconds");
 DEFINE_int32(region_split_check_interval_s, 300, "split check interval seconds");
@@ -550,6 +553,28 @@ bool Server::InitCrontabManager() {
       FLAGS_server_approximate_size_metrics_collect_interval_s * 1000,
       true,
       [](void*) { Server::GetInstance().GetStoreMetricsManager()->CollectApproximateSizeMetrics(); },
+  });
+
+  // Add rocksdb statistics metrics crontab (gated by FLAGS_enable_rocksdb_statistics_metric inside Collect)
+  FLAGS_rocksdb_statistics_metric_collect_interval_s =
+      GetInterval(config, "server.rocksdb_statistics_metric_collect_interval_s",
+                  FLAGS_rocksdb_statistics_metric_collect_interval_s);
+  crontab_configs_.push_back({
+      "ROCKSDB_STATISTICS_METRICS",
+      {pb::common::STORE, pb::common::INDEX, pb::common::DOCUMENT},
+      FLAGS_rocksdb_statistics_metric_collect_interval_s * 1000,
+      true,
+      [](void*) {
+        auto& metrics = RocksdbStatisticsMetrics::GetInstance();
+        auto rocks_raw_engine = Server::GetInstance().GetRocksRawEngine();
+        if (rocks_raw_engine != nullptr) {
+          metrics.Collect("store", rocks_raw_engine->GetStatistics());
+        }
+        auto log_storage = Server::GetInstance().GetRaftLogStorage();
+        if (log_storage != nullptr) {
+          metrics.Collect("raft_log", log_storage->GetStatistics());
+        }
+      },
   });
 
   // Add scan crontab

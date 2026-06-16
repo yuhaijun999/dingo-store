@@ -478,6 +478,9 @@ bool RocksLogStorage::InitRocksDB() {
   db_options.log_file_time_to_roll = FLAGS_rocks_log_file_time_to_roll_s;
   db_options.use_direct_io_for_flush_and_compaction = true;
   db_options.manual_wal_flush = false;
+  // Create a Statistics object so the periodic stats dump above has something to dump, and so the
+  // raft-log DB's tickers/histograms can be exposed as metrics (see RocksdbStatisticsMetrics).
+  db_options.statistics = rocksdb::CreateDBStatistics();
 
   std::vector<rocksdb::ColumnFamilyDescriptor> column_family_descs;
   column_family_descs.push_back(rocksdb::ColumnFamilyDescriptor("default", GenColumnFamilyOptions()));

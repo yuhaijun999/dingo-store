@@ -294,6 +294,12 @@ class RocksRawEngine : public RawEngine {
 
   std::vector<int64_t> GetApproximateSizes(const std::string& cf_name, std::vector<pb::common::Range>& ranges) override;
 
+  // RocksDB Statistics object created in InitDB (see db_options.statistics). Returned for periodic
+  // metric collection; nullptr before the DB is opened.
+  std::shared_ptr<rocksdb::Statistics> GetStatistics() {
+    return db_ != nullptr ? db_->GetDBOptions().statistics : nullptr;
+  }
+
  private:
   friend rocks::Reader;
   friend rocks::Writer;
