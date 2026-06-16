@@ -37,6 +37,7 @@
 #include "fmt/format.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "metrics/rocksdb_event_listener.h"
 #include "proto/common.pb.h"
 #include "proto/store_internal.pb.h"
 #include "rocksdb/advanced_options.h"
@@ -481,6 +482,11 @@ bool RocksLogStorage::InitRocksDB() {
   // Create a Statistics object so the periodic stats dump above has something to dump, and so the
   // raft-log DB's tickers/histograms can be exposed as metrics (see RocksdbStatisticsMetrics).
   db_options.statistics = rocksdb::CreateDBStatistics();
+  // Observability-only event listener: real-time flush/compaction/stall/error metrics (see
+  // RocksdbEventListener). Off by default; kept alive by db_options.listeners for the DB's lifetime.
+  if (FLAGS_enable_rocksdb_event_listener) {
+    db_options.listeners.emplace_back(std::make_shared<RocksdbEventListener>("raft_log"));
+  }
 
   std::vector<rocksdb::ColumnFamilyDescriptor> column_family_descs;
   column_family_descs.push_back(rocksdb::ColumnFamilyDescriptor("default", GenColumnFamilyOptions()));

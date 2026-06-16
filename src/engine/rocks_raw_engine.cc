@@ -38,6 +38,7 @@
 #include "engine/raw_engine.h"
 #include "engine/snapshot.h"
 #include "engine/write_compaction_filter.h"
+#include "metrics/rocksdb_event_listener.h"
 #include "fmt/core.h"
 #include "gflags/gflags.h"
 #include "proto/common.pb.h"
@@ -1023,6 +1024,11 @@ rocksdb::DB* RocksRawEngine::InitDB(const std::string& db_path, rocks::ColumnFam
   db_options.log_file_time_to_roll = ConfigHelper::GetRocksDBLogFileTimeToRollSec();
   db_options.use_direct_io_for_flush_and_compaction = true;
   db_options.statistics=rocksdb::CreateDBStatistics();
+  // Observability-only event listener: real-time flush/compaction/stall/error metrics (see
+  // RocksdbEventListener). Off by default; kept alive by db_options.listeners for the DB's lifetime.
+  if (FLAGS_enable_rocksdb_event_listener) {
+    db_options.listeners.emplace_back(std::make_shared<RocksdbEventListener>("store"));
+  }
 
   DINGO_LOG(INFO) << fmt::format("[rocksdb] config max_background_jobs({}) max_subcompactions({})",
                                  db_options.max_background_jobs, db_options.max_subcompactions);
