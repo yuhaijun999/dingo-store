@@ -15,12 +15,17 @@
 #include "server/service_helper.h"
 
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <string_view>
 
+#include "bvar/bvar.h"
 #include "butil/status.h"
 #include "common/helper.h"
 #include "common/logging.h"
@@ -33,6 +38,52 @@
 #include "vector/codec.h"
 
 namespace dingodb {
+
+namespace {
+
+// Lazily-created, per-stage bvar::Adder registry for the tombstone-related perf values that were
+// previously only returned in the RPC response (Tracker::ElapsedTime). Keyed by the exposed metric
+// name; created on first sight. Process-level, thread-safe.
+std::mutex g_tombstone_perf_metric_mutex;
+std::map<std::string, std::unique_ptr<bvar::Adder<int64_t>>> g_tombstone_perf_metric_adders;
+
+bvar::Adder<int64_t>* GetOrCreateTombstonePerfAdder(const std::string& name) {
+  // caller holds g_tombstone_perf_metric_mutex
+  auto it = g_tombstone_perf_metric_adders.find(name);
+  if (it != g_tombstone_perf_metric_adders.end()) {
+    return it->second.get();
+  }
+  auto adder = std::make_unique<bvar::Adder<int64_t>>();
+  adder->expose(name);
+  auto* raw = adder.get();
+  g_tombstone_perf_metric_adders.emplace(name, std::move(adder));
+  return raw;
+}
+
+// Sanitize a stage name (e.g. "init:get_snapshot_reader") into a metric-name-safe token.
+std::string SanitizeStageName(const std::string& stage) {
+  std::string result = stage;
+  for (auto& c : result) {
+    if (std::isalnum(static_cast<unsigned char>(c)) == 0) {
+      c = '_';
+    }
+  }
+  return result;
+}
+
+}  // namespace
+
+void AccumulateTombstonePerfMetric(const std::string& stage_name, int64_t internal_tombstone_count,
+                                   int64_t internal_skipped_count, int64_t skip_version) {
+  const std::string stage = SanitizeStageName(stage_name);
+
+  std::lock_guard<std::mutex> lock(g_tombstone_perf_metric_mutex);
+  *GetOrCreateTombstonePerfAdder(fmt::format("dingo_rocksdb_perf_{}_internal_tombstone_count", stage))
+      << internal_tombstone_count;
+  *GetOrCreateTombstonePerfAdder(fmt::format("dingo_rocksdb_perf_{}_internal_skipped_count", stage))
+      << internal_skipped_count;
+  *GetOrCreateTombstonePerfAdder(fmt::format("dingo_rocksdb_perf_{}_skip_version", stage)) << skip_version;
+}
 
 DEFINE_int64(service_log_threshold_time_ns, 1000000000L, "service log threshold time ns");
 BRPC_VALIDATE_GFLAG(service_log_threshold_time_ns, brpc::PositiveInteger);

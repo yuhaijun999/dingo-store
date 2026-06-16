@@ -203,6 +203,11 @@ class ServiceClosure : public TrackClosure {
   U* response_;
 };
 
+// Accumulate the tombstone-related perf values of one ElapsedTime stage (previously only returned in
+// the RPC response) into per-stage process-level bvar metrics. Defined in service_helper.cc.
+void AccumulateTombstonePerfMetric(const std::string& stage_name, int64_t internal_tombstone_count,
+                                   int64_t internal_skipped_count, int64_t skip_version);
+
 inline void SetPbMessageResponseInfo(google::protobuf::Message* message, TrackerPtr tracker) {
   if (BAIDU_UNLIKELY(message == nullptr || tracker == nullptr)) {
     return;
@@ -249,6 +254,11 @@ inline void SetPbMessageResponseInfo(google::protobuf::Message* message, Tracker
       perf_summary->set_miss_block_count(summary.miss_block_cache_count);
       perf_summary->set_internal_skipped_count(summary.internal_skipped_count);
       perf_summary->set_internal_tombstone_count(summary.internal_tombstone_count);
+
+      // Also publish these RPC-returned tombstone-related values as per-stage bvar metrics so they
+      // can be monitored in aggregate (Prometheus), not just inspected per-RPC-response.
+      AccumulateTombstonePerfMetric(et.name, static_cast<int64_t>(summary.internal_tombstone_count),
+                                    static_cast<int64_t>(summary.internal_skipped_count), et.skip_versions);
       // auto* perf_context = mut_elapsed_time->mutable_rocksdb_perf_context();
       // perf_context->set_block_cache_hit_count(et.rocksdb_perf.block_cache_hit_count);
       // perf_context->set_block_read_count(et.rocksdb_perf.block_read_count);
