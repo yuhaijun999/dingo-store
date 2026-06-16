@@ -15,11 +15,14 @@
 #include "metrics/rocksdb_statistics_metrics.h"
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "fmt/core.h"
 #include "gflags/gflags.h"
+#include "rocksdb/db.h"
 #include "rocksdb/statistics.h"
 
 namespace dingodb {
@@ -71,6 +74,39 @@ const std::vector<std::pair<rocksdb::Histograms, const char*>>& Histograms() {
   return kHistograms;
 }
 
+// Curated current-state DB properties read via GetIntProperty (per column family). `suffix` is the
+// metric-name suffix; `prop` is the RocksDB property key.
+const std::vector<std::pair<const char*, const char*>>& IntProperties() {
+  static const std::vector<std::pair<const char*, const char*>> kProperties = {
+      // compaction backlog / progress (directly reflects whether GC/Tombstone compaction keeps up)
+      {"pending_compaction_bytes", "rocksdb.estimate-pending-compaction-bytes"},
+      {"compaction_pending", "rocksdb.compaction-pending"},
+      {"num_running_compactions", "rocksdb.num-running-compactions"},
+      {"num_running_flushes", "rocksdb.num-running-flushes"},
+      {"mem_table_flush_pending", "rocksdb.mem-table-flush-pending"},
+      // memtable state / tombstones in memtable
+      {"num_immutable_mem_table", "rocksdb.num-immutable-mem-table"},
+      {"cur_size_all_mem_tables", "rocksdb.cur-size-all-mem-tables"},
+      {"size_all_mem_tables", "rocksdb.size-all-mem-tables"},
+      {"num_entries_active_mem_table", "rocksdb.num-entries-active-mem-table"},
+      {"num_deletes_active_mem_table", "rocksdb.num-deletes-active-mem-table"},
+      {"num_deletes_imm_mem_tables", "rocksdb.num-deletes-imm-mem-tables"},
+      // size / key estimates
+      {"estimate_num_keys", "rocksdb.estimate-num-keys"},
+      {"estimate_live_data_size", "rocksdb.estimate-live-data-size"},
+      {"live_sst_files_size", "rocksdb.live-sst-files-size"},
+      {"total_sst_files_size", "rocksdb.total-sst-files-size"},
+      // write stall / health
+      {"is_write_stopped", "rocksdb.is-write-stopped"},
+      {"actual_delayed_write_rate", "rocksdb.actual-delayed-write-rate"},
+      {"background_errors", "rocksdb.background-errors"},
+  };
+  return kProperties;
+}
+
+// Number of LSM levels to report num-files-at-levelN for (RocksDB default is 7: L0..L6).
+constexpr int kNumLevelsToReport = 7;
+
 }  // namespace
 
 RocksdbStatisticsMetrics& RocksdbStatisticsMetrics::GetInstance() {
@@ -119,6 +155,49 @@ void RocksdbStatisticsMetrics::Collect(const std::string& db_label,
         ->set_value(static_cast<int64_t>(data.average));
     GetOrCreate(fmt::format("dingo_metrics_rocksdb_{}_{}_max", db_label, suffix))
         ->set_value(static_cast<int64_t>(data.max));
+  }
+}
+
+void RocksdbStatisticsMetrics::CollectProperties(
+    const std::string& db_label, rocksdb::DB* db,
+    const std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>>& column_families) {
+  if (!FLAGS_enable_rocksdb_statistics_metric) {
+    return;
+  }
+  if (db == nullptr || column_families.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  for (const auto& [cf_name, cf_handle] : column_families) {
+    if (cf_handle == nullptr) {
+      continue;
+    }
+
+    // Integer properties: dingo_metrics_rocksdb_<db>_<cf>_<suffix>
+    for (const auto& [suffix, prop] : IntProperties()) {
+      uint64_t value = 0;
+      if (db->GetIntProperty(cf_handle, prop, &value)) {
+        GetOrCreate(fmt::format("dingo_metrics_rocksdb_{}_{}_{}", db_label, cf_name, suffix))
+            ->set_value(static_cast<int64_t>(value));
+      }
+    }
+
+    // Per-level file count (string property): dingo_metrics_rocksdb_<db>_<cf>_num_files_at_level<N>
+    for (int level = 0; level < kNumLevelsToReport; ++level) {
+      std::string value;
+      if (db->GetProperty(cf_handle, fmt::format("rocksdb.num-files-at-level{}", level), &value)) {
+        int64_t num_files = 0;
+        try {
+          num_files = std::stoll(value);
+        } catch (const std::exception&) {
+          continue;
+        }
+        GetOrCreate(fmt::format("dingo_metrics_rocksdb_{}_{}_num_files_at_level{}", db_label, cf_name, level))
+            ->set_value(num_files);
+      }
+    }
   }
 }
 

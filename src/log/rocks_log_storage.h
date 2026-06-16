@@ -232,6 +232,17 @@ class RocksLogStorage {
     return db_ != nullptr ? db_->GetDBOptions().statistics : nullptr;
   }
 
+  // For per-CF DB-property metric collection (see RocksdbStatisticsMetrics::CollectProperties). The
+  // raft-log DB has a single "default" column family.
+  rocksdb::DB* GetRawDBPtr() { return db_.get(); }
+  std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>> GetColumnFamilyHandlePairs() {
+    std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>> pairs;
+    if (!family_handles_.empty()) {
+      pairs.emplace_back("default", family_handles_[0]);
+    }
+    return pairs;
+  }
+
  private:
   bool InitExecutionQueue();
   bool CloseExecutionQueue();

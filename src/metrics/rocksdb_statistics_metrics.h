@@ -20,8 +20,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "bvar/status.h"
+#include "rocksdb/db.h"
 #include "rocksdb/statistics.h"
 
 namespace dingodb {
@@ -48,6 +51,13 @@ class RocksdbStatisticsMetrics {
   // Read the curated tickers/histograms from `statistics` and push them into the bvar variables
   // tagged with `db_label`. Safe to call with a null `statistics` (skipped). Thread-safe.
   void Collect(const std::string& db_label, const std::shared_ptr<rocksdb::Statistics>& statistics);
+
+  // Read the curated current-state DB properties (compaction backlog, level files, memtable/tombstone
+  // counts, write stall ...) per column family via GetIntProperty/GetProperty, and expose them as
+  // bvar gauges named dingo_metrics_rocksdb_<db_label>_<cf>_<metric>. Safe to call with a null `db`
+  // or empty `column_families` (skipped). Thread-safe.
+  void CollectProperties(const std::string& db_label, rocksdb::DB* db,
+                         const std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>>& column_families);
 
  private:
   // Lazily create-and-expose (and cache) a bvar::Status for `name` on first sight.

@@ -300,6 +300,17 @@ class RocksRawEngine : public RawEngine {
     return db_ != nullptr ? db_->GetDBOptions().statistics : nullptr;
   }
 
+  // For per-CF DB-property metric collection (see RocksdbStatisticsMetrics::CollectProperties).
+  // GetRawDBPtr() is nullptr before open (and for the XDPRocks engine, whose base db_ is unused).
+  rocksdb::DB* GetRawDBPtr() { return db_.get(); }
+  std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>> GetColumnFamilyHandlePairs() {
+    std::vector<std::pair<std::string, rocksdb::ColumnFamilyHandle*>> pairs;
+    for (const auto& [cf_name, cf] : column_families_) {
+      pairs.emplace_back(cf_name, cf->GetHandle());
+    }
+    return pairs;
+  }
+
  private:
   friend rocks::Reader;
   friend rocks::Writer;

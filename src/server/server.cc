@@ -569,10 +569,14 @@ bool Server::InitCrontabManager() {
         auto rocks_raw_engine = Server::GetInstance().GetRocksRawEngine();
         if (rocks_raw_engine != nullptr) {
           metrics.Collect("store", rocks_raw_engine->GetStatistics());
+          metrics.CollectProperties("store", rocks_raw_engine->GetRawDBPtr(),
+                                    rocks_raw_engine->GetColumnFamilyHandlePairs());
         }
         auto log_storage = Server::GetInstance().GetRaftLogStorage();
         if (log_storage != nullptr) {
           metrics.Collect("raft_log", log_storage->GetStatistics());
+          metrics.CollectProperties("raft_log", log_storage->GetRawDBPtr(),
+                                    log_storage->GetColumnFamilyHandlePairs());
         }
       },
   });
