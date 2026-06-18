@@ -153,6 +153,13 @@ class TxnIterator {
   // Lock collection state.
   bool lock_collection_enabled_{false};
   pb::store::LockInfo current_lock_info_;
+
+  // [F4] Whether this scan must consult the lock CF. Mirrors TiKV need_check_locks.
+  // SI always checks locks (a lock with lock_ts <= start_ts may later commit into the snapshot).
+  // RC may skip the lock CF entirely (no conflict check, no lock cursor) ONLY when the opt-in flag
+  // FLAGS_txn_scan_rc_skip_lock is on AND lock collection is not requested (lock collection still
+  // needs the lock cursor). Computed in Init(); defaults to true so the flag-off path is unchanged.
+  bool need_check_locks_{true};
 };
 using TxnIteratorPtr = std::shared_ptr<TxnIterator>;
 

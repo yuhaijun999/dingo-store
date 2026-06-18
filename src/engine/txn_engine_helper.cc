@@ -114,6 +114,15 @@ DEFINE_bool(txn_scan_adaptive_seek, false,
             "Seek to the next user_key (default off; keep off when measuring filter benefit)");
 DEFINE_int64(txn_scan_seek_bound, 8, "max Next() calls within one user_key before switching to Seek");
 
+// [F4] RC lock-skip optimization. Default OFF (RC still builds the lock cursor and runs the lock
+// conflict check exactly as today). When on, a ReadCommitted scan that does NOT request lock
+// collection skips the lock CF entirely (no lock cursor, no conflict check), mirroring TiKV's
+// need_check_locks(Rc)->false. RC reads the latest committed version from the write CF and ignores
+// uncommitted locks, so this is safe for RC; SI is never affected by this flag.
+DEFINE_bool(txn_scan_rc_skip_lock, false,
+            "ReadCommitted scan skips the lock CF (no lock cursor, no conflict check) when lock "
+            "collection is not requested (default off; SI is never affected)");
+
 DEFINE_int64(max_restore_data_memory_size, 10 * 1024 * 1024, "max restore data memory size");
 BRPC_VALIDATE_GFLAG(max_restore_data_memory_size, brpc::PositiveInteger);
 DEFINE_int64(max_restore_count, 32768, "max restore count");
@@ -491,6 +500,14 @@ butil::Status TxnReader::GetOldValue(const std::string &key, int64_t start_ts, b
 butil::Status TxnIterator::Init(TrackerPtr tracker) {
   uint64_t step_time = Helper::TimestampUs();
 
+  // [F4] Decide whether this scan must consult the lock CF. Mirrors TiKV need_check_locks.
+  // SI always checks locks. RC may skip the lock CF (no cursor, no conflict check) ONLY when the
+  // opt-in flag is on AND lock collection is not requested (collection still needs the lock cursor).
+  // Default (flag off) keeps this true, i.e. byte-for-byte today's behavior. lock_collection_enabled_
+  // must be set BEFORE Init() for this to be correct (see TxnEngineHelper::Scan).
+  need_check_locks_ = (isolation_level_ == pb::store::IsolationLevel::SnapshotIsolation) || lock_collection_enabled_ ||
+                      !FLAGS_txn_scan_rc_skip_lock;
+
   snapshot_ = raw_engine_->GetSnapshot();
   if (snapshot_ == nullptr) {
     DINGO_LOG(ERROR) << "[txn]Scan GetSnapshot failed";
@@ -529,15 +546,24 @@ butil::Status TxnIterator::Init(TrackerPtr tracker) {
   }
 
   // construct lock iter
+  // [F4b] RC scans that skip the lock CF build no lock cursor at all (need_check_locks_ == false),
+  // mirroring TiKV which does not create the lock cursor for RC. lock_iter_ stays null and every
+  // lock-CF dereference downstream is guarded by need_check_locks_ / a null check.
   step_time = Helper::TimestampUs();
-  IteratorOptions lock_iter_options;
-  lock_iter_options.lower_bound = mvcc::Codec::EncodeKey(range_.start_key(), Constant::kLockVer);
-  lock_iter_options.upper_bound = mvcc::Codec::EncodeKey(range_.end_key(), Constant::kLockVer);
+  if (need_check_locks_) {
+    IteratorOptions lock_iter_options;
+    lock_iter_options.lower_bound = mvcc::Codec::EncodeKey(range_.start_key(), Constant::kLockVer);
+    lock_iter_options.upper_bound = mvcc::Codec::EncodeKey(range_.end_key(), Constant::kLockVer);
 
-  lock_iter_ = reader_->NewIterator(Constant::kTxnLockCF, snapshot_, lock_iter_options);
-  if (lock_iter_ == nullptr) {
-    DINGO_LOG(ERROR) << "[txn]Scan NewIterator lock failed, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
-    return butil::Status(pb::error::Errno::EINTERNAL, "new iterator failed");
+    lock_iter_ = reader_->NewIterator(Constant::kTxnLockCF, snapshot_, lock_iter_options);
+    if (lock_iter_ == nullptr) {
+      DINGO_LOG(ERROR) << "[txn]Scan NewIterator lock failed, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
+      return butil::Status(pb::error::Errno::EINTERNAL, "new iterator failed");
+    }
+  } else {
+    lock_iter_ = nullptr;
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+        << "[txn]Init RC skip lock CF, no lock cursor created, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
   }
 
   uint64_t lock_iter_elapsed = Helper::TimestampUs() - step_time;
@@ -560,9 +586,9 @@ butil::Status TxnIterator::Init(TrackerPtr tracker) {
   uint64_t write_seek_elapsed = Helper::TimestampUs() - step_time;
 
   step_time = Helper::TimestampUs();
-  {
+  if (need_check_locks_) {
     RocksDBPerfGuard perf_guard;
-    lock_iter_->Seek(lock_iter_options.lower_bound);
+    lock_iter_->Seek(mvcc::Codec::EncodeKey(range_.start_key(), Constant::kLockVer));
     lock_seek_perf = perf_guard.GetPerfContext();
   }
   uint64_t lock_seek_elapsed = Helper::TimestampUs() - step_time;
@@ -575,11 +601,11 @@ butil::Status TxnIterator::Init(TrackerPtr tracker) {
     tracker->RecordElapsedTime("init:lock_iter_seek", lock_seek_elapsed, 0, lock_seek_perf);
   }
 
-  if ((!write_iter_->Valid()) && (!lock_iter_->Valid())) {
+  if ((!write_iter_->Valid()) && (lock_iter_ == nullptr || !lock_iter_->Valid())) {
     DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
         << "[txn]write_iter is not valid and lock_iter is not valid, start_ts: " << start_ts_
         << ", seek_ts: " << seek_ts_ << ", write_iter->Valid(): " << write_iter_->Valid()
-        << ", lock_iter->Valid(): " << lock_iter_->Valid();
+        << ", lock_iter->Valid(): " << (lock_iter_ != nullptr && lock_iter_->Valid());
   }
 
   return butil::Status::OK();
@@ -628,18 +654,22 @@ butil::Status TxnIterator::InnerSeek(const std::string &key) {
   last_write_key_.clear();
 
   uint64_t lock_seek_time = Helper::TimestampMs();
-  lock_iter_->Seek(mvcc::Codec::EncodeKey(key, Constant::kLockVer));
-  int64_t lock_ts = 0;
-  if (lock_iter_->Valid()) {
-    auto ret = mvcc::Codec::DecodeKey(lock_iter_->Key(), last_lock_key_, lock_ts);
-    if (!ret) {
-      DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, lock_iter->key: " << Helper::StringToHex(lock_iter_->Key())
-                       << ", start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
+  // [F4b] RC without lock CF: no lock cursor, last_lock_key_ stays empty so GetCurrentValue/InnerNext
+  // take the write-only path.
+  if (need_check_locks_) {
+    lock_iter_->Seek(mvcc::Codec::EncodeKey(key, Constant::kLockVer));
+    int64_t lock_ts = 0;
+    if (lock_iter_->Valid()) {
+      auto ret = mvcc::Codec::DecodeKey(lock_iter_->Key(), last_lock_key_, lock_ts);
+      if (!ret) {
+        DINGO_LOG(FATAL) << "[txn]Scan decode txn key failed, lock_iter->key: " << Helper::StringToHex(lock_iter_->Key())
+                         << ", start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_;
+      }
+    } else {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan lock_iter is invalid, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
+          << ", last_lock_key: " << Helper::StringToHex(last_lock_key_);
     }
-  } else {
-    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
-        << "[txn]Scan lock_iter is invalid, start_ts: " << start_ts_ << ", seek_ts: " << seek_ts_
-        << ", last_lock_key: " << Helper::StringToHex(last_lock_key_);
   }
   uint64_t lock_seek_elapsed = Helper::TimestampMs() - lock_seek_time;
 
@@ -740,7 +770,9 @@ butil::Status TxnIterator::InnerNext() {
 
   value_.clear();
 
-  if (lock_iter_->Valid() && key_ >= last_lock_key_) {
+  // [F4b] RC without lock CF (lock_iter_ == nullptr): skip the lock-cursor advance entirely;
+  // last_lock_key_ stays empty so the write-only path below is taken.
+  if (need_check_locks_ && lock_iter_->Valid() && key_ >= last_lock_key_) {
     while (lock_iter_->Valid()) {
       lock_iter_->Next();
       int64_t lock_ts = 0;
@@ -791,7 +823,7 @@ butil::Status TxnIterator::InnerNext() {
         << "[txn]Scan last_lock_key_ and last_write_key_ are empty, start_ts: " << start_ts_
         << ", seek_ts: " << seek_ts_ << ", key_: " << Helper::StringToHex(key_);
 
-    if (!lock_iter_->Valid() && !write_iter_->Valid()) {
+    if ((lock_iter_ == nullptr || !lock_iter_->Valid()) && !write_iter_->Valid()) {
       DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
           << "[txn]Scan lock_iter_ and write_iter_ are invalid, the iterator is finished, start_ts: " << start_ts_
           << ", seek_ts: " << seek_ts_ << ", key_: " << Helper::StringToHex(key_);
@@ -830,6 +862,13 @@ butil::Status TxnIterator::InnerNext() {
 // txn_scan_seek_bound old versions to skip). Only updated when txn_scan_adaptive_seek is on. Defined
 // here (before GotoNextUserKeyInWriteIter) so it is in scope at the use site.
 bvar::Adder<int64_t> g_txn_scan_over_seek_bound("dingo_txn_scan_over_seek_bound");
+
+// [F1] Count how often the version-locating loop (GetUserValueInWriteIter) falls back to a Seek: a
+// user_key had more than txn_scan_seek_bound newer-than-target versions to skip past. This is a
+// DIFFERENT physical action from g_txn_scan_over_seek_bound above, which counts fallbacks while
+// advancing to the NEXT user_key. Keeping them separate lets us tell "deep version chain on one
+// user_key" apart from "many old versions across user_keys" when grading the optimization.
+bvar::Adder<int64_t> g_txn_scan_over_seek_bound_version("dingo_txn_scan_over_seek_bound_version");
 
 butil::Status TxnIterator::GotoNextUserKeyInWriteIter(std::shared_ptr<Iterator> write_iter, std::string prev_user_key,
                                                       std::string &last_write_key, int64_t &skipped_count) {
@@ -908,6 +947,30 @@ butil::Status TxnIterator::GetUserValueInWriteIter(std::shared_ptr<Iterator> wri
                                                    std::string &user_value, int64_t &skipped_count) {
   is_value_found = false;
   int64_t version_count = 0;
+
+  // [F1/F2/F3] target_ts is the upper bound of acceptable commit_ts for this user_key. It unifies
+  // the SI and RC visibility filter into a single "commit_ts > target_ts -> skip" condition, just
+  // like TiKV's version loop where SI and RC share the same code and only cfg.ts differs.
+  //   SI: target_ts = start_ts          -> skip versions newer than the fixed snapshot point.
+  //   RC: target_ts = seek_ts (kMaxVer) -> condition is NEVER true, so no version is skipped; RC
+  //       reads the latest committed version (the write CF chain head). This makes the former
+  //       "RC only logs, no filter" branch explicit instead of looking like a missing filter.
+  const int64_t target_ts =
+      (isolation_level == pb::store::IsolationLevel::SnapshotIsolation) ? start_ts : seek_ts;
+
+  // [F1] Adaptive seek state for the version-locating loop, mirroring GotoNextUserKeyInWriteIter.
+  // Default OFF (FLAGS_txn_scan_adaptive_seek). Enabled ONLY for SI: under RC target_ts == kMaxVer
+  // so the skip condition never fires (skip_run stays 0) and a Seek to user_key@kMaxVer would land
+  // back on the chain head (no progress) -- so RC deliberately never enters the fallback.
+  const bool adaptive_seek =
+      FLAGS_txn_scan_adaptive_seek && isolation_level == pb::store::IsolationLevel::SnapshotIsolation;
+  const int64_t seek_bound = FLAGS_txn_scan_seek_bound;
+  bool did_seek = false;
+  // Consecutive newer-than-target version skips within this user_key (the fallback trigger). Reset
+  // to 0 once a visible version is reached. Distinct from version_count, which accumulates ALL skips
+  // (newer versions + Rollback + illegal ops) for the skipped_count metric.
+  int64_t skip_run = 0;
+
   while (write_iter->Valid()) {
     int64_t commit_ts;
     auto ret1 = mvcc::Codec::DecodeKey(write_iter->Key(), last_write_key, commit_ts);
@@ -925,30 +988,63 @@ butil::Status TxnIterator::GetUserValueInWriteIter(std::shared_ptr<Iterator> wri
       return butil::Status::OK();
     }
 
-    // check isolation_level
-    if (isolation_level == pb::store::IsolationLevel::SnapshotIsolation) {
-      if (commit_ts > start_ts) {
-        DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
-            << "[txn]Scan commit_ts > start_ts, means this value is not accepted, will go to next, start_ts: "
-            << start_ts << ", commit_ts: " << commit_ts << ", user_key: " << Helper::StringToHex(user_key);
-        write_iter->Next();
-        version_count++;
+    if (last_write_key < user_key) {
+      // [F1] Defensive: a Seek fallback target is always within this user_key, so descending-ts
+      // encoding can never land before user_key. If it somehow does, treat it as no value rather
+      // than spinning forever.
+      DINGO_LOG(ERROR) << "[txn]Scan last_write_key < user_key (unexpected seek landing), start_ts: " << start_ts
+                       << ", seek_ts: " << seek_ts << ", last_write_key: " << Helper::StringToHex(last_write_key)
+                       << ", user_key: " << Helper::StringToHex(user_key);
+      skipped_count += version_count;
+      return butil::Status::OK();
+    }
 
-        // we need to setup is_value_found to true, so that the caller can go to next user_key
-        // is_value_found means the value is found, not means the value is valid
-        // the user_value is not valid, so we need to go to next user_key
-        is_value_found = true;
-        user_value = std::string();
-        continue;
-      }
-    } else if (isolation_level == pb::store::IsolationLevel::ReadCommitted) {
-      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
-          << "[txn]Scan RC, commit_ts: " << commit_ts << ", start_ts: " << start_ts << ", seek_ts: " << seek_ts
-          << ", user_key: " << Helper::StringToHex(user_key);
-    } else {
+    // check isolation_level
+    if (isolation_level != pb::store::IsolationLevel::SnapshotIsolation &&
+        isolation_level != pb::store::IsolationLevel::ReadCommitted) {
       DINGO_LOG(ERROR) << "[txn]BatchGet invalid isolation_level: " << isolation_level;
       return butil::Status(pb::error::Errno::EILLEGAL_PARAMTETERS, "invalid isolation_level");
     }
+
+    // [F1/F2/F3] Unified visibility filter. SI skips newer-than-snapshot versions; RC (target_ts ==
+    // kMaxVer) never skips and falls straight through to the chain head (latest committed version).
+    if (commit_ts > target_ts) {
+      DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_detail)
+          << "[txn]Scan commit_ts > target_ts, version not visible, will go to next, start_ts: " << start_ts
+          << ", seek_ts: " << seek_ts << ", commit_ts: " << commit_ts << ", target_ts: " << target_ts
+          << ", user_key: " << Helper::StringToHex(user_key);
+
+      // [F1] After seek_bound consecutive newer-version skips on the same user_key, jump straight to
+      // the first version with commit_ts <= target_ts in ONE Seek instead of linear Next(). did_seek
+      // bounds it to a single fallback so forward progress is always guaranteed. Only reachable for
+      // SI (adaptive_seek is SI-only).
+      if (adaptive_seek && !did_seek && seek_bound > 0 && skip_run >= seek_bound) {
+        did_seek = true;
+        g_txn_scan_over_seek_bound_version << 1;
+        // append_ts equivalent: EncodeKey(user_key, target_ts). With WriteLongWithNegation the ts is
+        // encoded descending, so this Seek lands on the first version whose commit_ts <= target_ts
+        // within user_key, or on the next user_key / end if none exists. The loop top re-decodes and
+        // re-validates the landing, so we do NOT count the Seek as a skipped version here.
+        // NOTE: this makes skipped_count (total_skipped_versions_) undercount the versions a Seek
+        // jumped over -- it is a diagnostic metric only and does not affect read correctness. Use
+        // g_txn_scan_over_seek_bound_version to observe how often the fallback fires.
+        write_iter->Seek(mvcc::Codec::EncodeKey(user_key, target_ts));
+        continue;
+      }
+
+      write_iter->Next();
+      version_count++;
+      skip_run++;
+
+      // we need to setup is_value_found to true, so that the caller can go to next user_key
+      // is_value_found means the value is found, not means the value is valid
+      // the user_value is not valid, so we need to go to next user_key
+      is_value_found = true;
+      user_value = std::string();
+      continue;
+    }
+    // commit_ts <= target_ts: this version is visible, reset the fallback run and handle its Op.
+    skip_run = 0;
 
     pb::store::WriteInfo write_info;
     auto ret2 = write_info.ParseFromArray(write_iter->Value().data(), write_iter->Value().size());
@@ -1034,6 +1130,33 @@ butil::Status TxnIterator::GetUserValueInWriteIter(std::shared_ptr<Iterator> wri
 
 butil::Status TxnIterator::GetCurrentValue() {
   bool check_lock_cf_first = false;
+
+  // [F4a/F4b] RC fast path: the lock CF is not consulted (lock_iter_ may be null and last_lock_key_
+  // is always empty). The value, if any, comes solely from the write CF. This both skips the lock
+  // conflict check (F4a) and avoids every lock_iter_ dereference below (F4b). Equivalent to TiKV's
+  // handle_lock returning Skip immediately for RC.
+  if (!need_check_locks_) {
+    if (last_write_key_.empty()) {
+      key_.clear();
+      return butil::Status::OK();
+    }
+    key_ = last_write_key_;
+    bool is_value_found = false;
+    butil::Status status = GetUserValueInWriteIter(write_iter_, reader_, isolation_level_, seek_ts_, start_ts_, key_,
+                                                   last_write_key_, is_value_found, value_, total_skipped_versions_);
+    if (!status.ok()) {
+      key_.clear();
+      value_.clear();
+      DINGO_LOG(ERROR) << fmt::format("[txn]Scan get user value in write_iter failed (RC fast path), key: {}, status: {}",
+                                      Helper::StringToHex(key_), status.error_str());
+      return status;
+    }
+    if (!is_value_found) {
+      // no valid value found, clear key_ to make the txn iterator invalid
+      key_.clear();
+    }
+    return butil::Status::OK();
+  }
 
   CHECK(!(last_write_key_.empty() && last_lock_key_.empty()));
 
@@ -1636,6 +1759,9 @@ butil::Status TxnEngineHelper::Scan(std::shared_ptr<Context> ctx, StreamPtr stre
         "[txn][{}] Scan current_stream_state is null, need to create new TxnIterator.", stream->StreamId());
     uint64_t iter_init_time = Helper::TimestampUs();
     auto iter = std::make_shared<TxnIterator>(raw_engine, range, start_ts, isolation_level, resolved_locks);
+    // [F4b] Must set lock collection BEFORE Init(): Init() computes need_check_locks_ from it to
+    // decide whether to build the lock cursor. RC + lock collection keeps the lock cursor.
+    iter->SetLockCollectionEnabled(lock_collection_enabled);
     butil::Status status = iter->Init(tracker);
     if (!status.ok()) {
       std::string s = fmt::format("[txn][{}] Scan init txn_iter failed, start_ts: {} range: {}  status: {}.",
@@ -1643,7 +1769,6 @@ butil::Status TxnEngineHelper::Scan(std::shared_ptr<Context> ctx, StreamPtr stre
       DINGO_LOG(ERROR) << s;
       return butil::Status(status.error_code(), s);
     }
-    iter->SetLockCollectionEnabled(lock_collection_enabled);
 
     uint64_t seek_start_time = Helper::TimestampUs();
     Tracker::RocksDBPerfContext seek_perf;
