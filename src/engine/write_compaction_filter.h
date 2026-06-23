@@ -20,15 +20,26 @@
 // current "GC writes N point tombstones" into "0 tombstone".
 //
 // The deletion decision MUST be a subset of what the existing raft-based GC (DoGcCoreTxn) would delete
-// at the same safe_point, so the filter never deletes anything the raft GC would keep. We therefore
-// replicate DoGcCoreTxn's decision logic exactly (see write_compaction_filter.cc).
+// at the same safe_point, so the filter never deletes anything the raft GC would keep.
 //
-// Baseline simplifications (full version restores them later):
+// Decision model (refactored after TiKV's do_filter remove_older state machine; see
+// TiKV-WriteCompactionFilter-三类Write处理.md). For each user_key, versions are visited newest->oldest:
+//   - Put  (first effective version at/below safe_point): kept (unless a newer Put/Delete exists above
+//           safe_point, then dropped to match DoGcCoreTxn), then remove_older_ = true.
+//   - Delete (first effective version): see the tombstone gate below; remove_older_ = true.
+//   - Rollback / Lock / unknown: noise / not-deleted-by-DoGcCoreTxn; do NOT set remove_older_.
+//   - any version once remove_older_ == true: dropped via kRemoveAndSkipUntil (zero tombstone).
+//
+// Tombstone safety (the key difference from a naive port): a Delete marker is only physically removed
+// when the compaction's view is COMPLETE (is_full_compaction), because C++ RocksDB 10.5.1 has no
+// is_bottommost_level(). On a partial compaction the marker is kept to shadow any lower-level old
+// version (preventing resurrection); its in-view older versions are still reclaimed. Gated by
+// FLAGS_gc_compaction_filter_tombstone_require_full_compaction (default true). See its DECLARE comment.
+//
+// Out of scope (still handled only by the retained raft GC backup):
 //   1. safe_point is taken from tenant 0 only (no cross-tenant min aggregation).
-//   2. Orphan data CF cleanup is NOT done here; orphan large values are reclaimed by the retained
-//      raft GC backup. The filter only evaporates write CF versions.
-//   3. RocksDB snapshot / read-path consistency (IgnoreSnapshots side effects) is shelved; baseline
-//      is for performance measurement on a test cluster only, not for production rollout.
+//   2. Orphan data CF cleanup (orphan large values reclaimed by raft GC). The filter only touches write CF.
+//   3. lock CF and GcKeys delegation to a GC worker are not implemented.
 
 #ifndef DINGODB_ENGINE_WRITE_COMPACTION_FILTER_H_  // NOLINT
 #define DINGODB_ENGINE_WRITE_COMPACTION_FILTER_H_
@@ -48,6 +59,18 @@ namespace dingodb {
 // before). DANGEROUS: when on, the filter physically drops expired MVCC versions during compaction.
 DECLARE_bool(gc_enable_compaction_filter);
 
+// Tombstone safety gate (default true = safe). RocksDB 10.5.1's C++ CompactionFilter::Context has no
+// is_bottommost_level(), so we cannot replicate TiKV's "keep the Delete marker at non-bottommost,
+// delete it only at bottommost" scheme directly. Instead we use is_full_compaction as the equivalent
+// "complete view" signal: a full compaction includes ALL table files for the key range, so every MVCC
+// version of a user_key is in this compaction's input -> deleting the Delete marker cannot resurrect a
+// lower-level version. When true (default), the filter only physically removes a Delete marker during a
+// full compaction; otherwise it keeps the marker (still shadowing any lower-level old version) and only
+// reclaims the versions BELOW it that are in this compaction's view. When false, the marker is removed
+// unconditionally (the old, DANGEROUS behavior that can resurrect deleted data on partial compactions;
+// kept only for A/B comparison and debugging).
+DECLARE_bool(gc_compaction_filter_tombstone_require_full_compaction);
+
 // Process-level safe_point shared with the filter. Refreshed every GC poll round from tenant 0's
 // safe_point (RegularDoGcHandler), monotonically increasing. The filter only drops versions whose
 // commit_ts <= this value. 0 means "not ready / do not GC".
@@ -64,7 +87,14 @@ extern std::atomic<bool> g_compaction_filter_gc_stop;
 // initialized in-place to avoid UB.
 class WriteCompactionFilter : public rocksdb::CompactionFilter {
  public:
-  explicit WriteCompactionFilter(int64_t safe_point) : safe_point_(safe_point) {}
+  // is_full_compaction comes from the compaction Context (see factory). tombstone_require_full_compaction
+  // is a snapshot of FLAGS_gc_compaction_filter_tombstone_require_full_compaction taken at construction,
+  // so a mid-compaction flag flip cannot make different versions of the same user_key use inconsistent
+  // tombstone policy.
+  WriteCompactionFilter(int64_t safe_point, bool is_full_compaction, bool tombstone_require_full_compaction)
+      : safe_point_(safe_point),
+        is_full_compaction_(is_full_compaction),
+        tombstone_require_full_compaction_(tombstone_require_full_compaction) {}
 
   const char* Name() const override { return "DingoWriteCompactionFilter"; }
 
@@ -78,16 +108,27 @@ class WriteCompactionFilter : public rocksdb::CompactionFilter {
   // commit_ts > safe_point_ are always kept.
   const int64_t safe_point_;
 
+  // Whether this compaction includes ALL table files for the key range (Context.is_full_compaction).
+  // Only then is it safe to physically remove a Delete marker (no lower-level version can resurrect).
+  const bool is_full_compaction_;
+
+  // Snapshot of the tombstone safety flag (see header DECLARE comment). When true, a Delete marker is
+  // removed only if is_full_compaction_; when false, removed unconditionally (DANGEROUS, old behavior).
+  const bool tombstone_require_full_compaction_;
+
   // Current user_key being processed; used to detect a user_key boundary and reset the per-key state.
   mutable std::string mvcc_key_prefix_;
 
-  // The two state flags below mirror DoGcCoreTxn exactly (txn_engine_helper.cc):
-  //   seen_put_or_delete_above_sp_  <-> is_exist_put_or_delete_key_if_write_ts_gt_safe_point_ts
-  //   first_below_sp_unconsumed_    <-> is_first_put_key_if_write_ts_le_safe_point_ts
-  // Together they implement the "the first valid version at/below safe_point must be kept" rule, but
-  // only when there is NO newer Put/Delete above safe_point.
+  // remove_older_: TiKV-style state machine bit. Set true once the first effective version (Put, or a
+  // Delete marker) at/below safe_point has been decided for this user_key; every OLDER version is then a
+  // redundant historical version and is dropped via kRemoveAndSkipUntil. Replaces the old
+  // first_below_sp_unconsumed_ flag (remove_older_ == true means "first effective version consumed").
+  mutable bool remove_older_ = false;
+
+  // seen_put_or_delete_above_sp_ <-> DoGcCoreTxn's is_exist_put_or_delete_key_if_write_ts_gt_safe_point_ts.
+  // Kept to preserve dingo's "drop the first Put at/below safe_point when a newer Put/Delete exists above
+  // safe_point" semantics (keeps the filter's delete set a subset of DoGcCoreTxn's).
   mutable bool seen_put_or_delete_above_sp_ = false;
-  mutable bool first_below_sp_unconsumed_ = true;
 };
 
 // Stateless factory. Created once and shared by all write CF compactions. CreateCompactionFilter is
