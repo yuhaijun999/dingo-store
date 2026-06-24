@@ -143,6 +143,20 @@ DEFINE_int64(gc_active_compaction_cold_sst_seconds, 86400,
              "without visible tombstones; 0 = disable cold fallback");
 DEFINE_validator(gc_active_compaction_score_based, &PassBool);
 
+// [GC-core toggle] Master switch for the raft-GC "main work" (the per-region point-delete of expired MVCC
+// versions, writer->TxnGc -> DoGcCoreTxn). Default true = keep doing raft GC exactly as before. Set false
+// (in conf) to STOP the per-region raft-GC point-delete for TXN regions only, letting the compaction
+// filter + active compaction reclaim the txn write CF instead (compaction has taken over that job).
+// SCOPE/SAFETY: this only gates TXN regions. Non-txn regions (DoGcCoreNonTxn: vector/document/raw stores)
+// have NO compaction-filter backup, so they are NEVER skipped (skipping would leak forever). Everything
+// else in RegularDoGcHandler (safe_point refresh g_compaction_filter_safe_point, gc_stop mirror, active
+// compaction trigger, SafePointManager/TaskTracker) runs regardless of this flag.
+DEFINE_bool(gc_enable_raft_gc_core, true,
+            "do the raft-GC main work (per-region point-delete of expired txn versions). Default true. "
+            "false = skip it for TXN regions (compaction filter + active compaction reclaim instead); "
+            "non-txn regions are still GC'd. safe_point refresh / active compaction are unaffected");
+DEFINE_validator(gc_enable_raft_gc_core, &PassBool);
+
 // [GC-Tombstone baseline step-6] Read-path SEEK_BOUND adaptive seek. Default OFF (pure Next() as today).
 // When on, while skipping the old versions of one user_key, after txn_scan_seek_bound Next() calls still
 // on the same user_key, jump past all remaining versions with a single Seek instead of linear Next().
@@ -6442,6 +6456,24 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
     }
   }
 
+  // [GC-core toggle] Safety check: disabling the raft-GC main work is only safe if compaction has taken
+  // over reclaiming the txn write CF. If main work is off but neither the compaction filter nor the active
+  // compaction scheduler is on, the txn write CF would NOT be GC'd by anyone (safe_point keeps advancing
+  // but nothing is physically reclaimed). Warn once so the operator can fix the config. Never FATAL.
+  if (!FLAGS_gc_enable_raft_gc_core &&
+      !(FLAGS_gc_enable_compaction_filter &&
+        (FLAGS_gc_enable_active_compaction || FLAGS_gc_active_compaction_score_based))) {
+    static std::atomic<bool> g_gc_core_disabled_warned{false};
+    bool expected = false;
+    if (g_gc_core_disabled_warned.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+      DINGO_LOG(WARNING) << "[txn_gc] gc_enable_raft_gc_core=false but compaction has NOT taken over "
+                            "(gc_enable_compaction_filter && (gc_enable_active_compaction || "
+                            "gc_active_compaction_score_based) is false): the txn write CF will NOT be "
+                            "garbage collected by anyone. Enable the compaction filter + active compaction, "
+                            "or set gc_enable_raft_gc_core=true.";
+    }
+  }
+
   bool all_gc_stop = true;
   for (auto [tenant_id, safe_point_ts_pair] : safe_point_ts_group) {
     if (!safe_point_ts_pair.first) {
@@ -6635,7 +6667,18 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
 
     auto writer = storage->GetEngineTxnWriter(ctx->StoreEngineType(), ctx->RawEngineType());
 
-    status = writer->TxnGc(ctx, safe_point_ts);
+    // [GC-core toggle] Skip the per-region raft-GC main work (point-delete of expired versions) only when
+    // gc_enable_raft_gc_core is off AND this is a TXN region -- the compaction filter + active compaction
+    // reclaim the txn write CF instead. Non-txn regions have NO compaction backup, so they are NEVER
+    // skipped (would leak). safe_point refresh (above, outside this loop) and the active compaction hook
+    // (below) run regardless, so disabling main work does not stall the compaction-based GC pipeline.
+    if (FLAGS_gc_enable_raft_gc_core || !region_ptr->IsTxn()) {
+      status = writer->TxnGc(ctx, safe_point_ts);
+    } else {
+      // Main work disabled for this txn region this round; treat as a successful no-op so the downstream
+      // active-compaction hook and bookkeeping proceed normally.
+      status = butil::Status::OK();
+    }
 
     if (gc_safe_point->GetGcStop()) {
       DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail)
