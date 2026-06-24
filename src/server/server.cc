@@ -101,6 +101,8 @@ DEFINE_int32(server_scrub_vector_index_interval_s, 60, "scrub vector index inter
 DEFINE_int32(raft_snapshot_interval_s, 120, "raft snapshot interval seconds");
 DEFINE_int32(gc_update_safe_point_interval_s, 60, "gc update safe point interval seconds");
 DEFINE_int32(gc_do_gc_interval_s, 60, "gc do gc interval seconds");
+// [GC-Tombstone refactor B3] Independent active compaction scheduler crontab interval.
+DEFINE_int32(gc_active_compaction_check_interval_s, 300, "active compaction scheduler check interval seconds");
 DEFINE_int32(balance_leader_interval_s, 60, "balance leader interval seconds");
 DEFINE_int32(balance_region_interval_s, 120, "balance region interval seconds");
 DEFINE_int32(recycle_job_interval_s, 60, "recycle job list interval seconds");
@@ -798,6 +800,20 @@ bool Server::InitCrontabManager() {
       FLAGS_gc_do_gc_interval_s * 1000,
       true,
       [](void*) { TxnEngineHelper::RegularDoGcHandler(nullptr); },
+  });
+
+  // [GC-Tombstone refactor B3] Add independent active compaction scheduler crontab. Runs on its own
+  // interval decoupled from raft GC; the handler itself is a no-op when gc_active_compaction_score_based
+  // is off (default), so registering it unconditionally is safe and gives a one-flag hot enable/rollback.
+  // Stops cleanly with the crontab manager on shutdown (CrontabManager::Destroy in server teardown).
+  FLAGS_gc_active_compaction_check_interval_s =
+      GetInterval(config, "gc.active_compaction_check_interval_s", FLAGS_gc_active_compaction_check_interval_s);
+  crontab_configs_.push_back({
+      "GC_ACTIVE_COMPACTION",
+      {pb::common::STORE, pb::common::INDEX, pb::common::DOCUMENT},
+      FLAGS_gc_active_compaction_check_interval_s * 1000,
+      true,
+      [](void*) { TxnEngineHelper::ActiveCompactionHandler(nullptr); },
   });
 
   if (FLAGS_enable_balance_leader) {

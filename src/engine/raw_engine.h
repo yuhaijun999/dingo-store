@@ -32,6 +32,41 @@
 
 namespace dingodb {
 
+// [GC-Tombstone baseline step-B1] Aggregated SST table properties over a key range of one CF.
+// Used by the active-compaction scheduler to estimate how much garbage a region holds before
+// deciding whether to issue a manual CompactRange. Intended for the write CF (Constant::kTxnWriteCF)
+// only. All fields are simple counters aggregated across the SSTs that overlap the requested range.
+//
+// Two groups of signals:
+//   * Phase-A signals come straight from RocksDB's built-in TableProperties (always available on the
+//     RocksRawEngine). NOTE (reviewer MF1): a dingo Delete "tombstone" is an op=Delete WriteInfo Put
+//     record (a plain RocksDB kValue entry), NOT a RocksDB Delete/SingleDelete. It therefore counts
+//     toward num_entries but NEVER toward num_deletions. So the phase-A primary scoring signal is
+//     num_entries plus "SST not full-compacted for a long time" (oldest_ancester_time); num_deletions
+//     / num_range_deletions are only a minor add-on (Rollback noise, residual raft-GC point deletes).
+//   * Phase-B signals are filled only when the MvccPropertiesCollector (step-B4) is registered on the
+//     write CF and its user-collected properties are present in the SST. Otherwise they stay 0 (old
+//     SSTs written before the collector, or the collector gflag is off) and the scheduler falls back
+//     to the phase-A signals.
+struct RangeTableProperties {
+  // ---- Phase-A: RocksDB built-in TableProperties (always populated by RocksRawEngine) ----
+  uint64_t num_entries = 0;          // total entries across overlapping SSTs (includes dingo tombstone Puts)
+  uint64_t num_deletions = 0;        // RocksDB Delete/SingleDelete tombstones (NOT dingo Delete markers)
+  uint64_t num_range_deletions = 0;  // RocksDB range tombstones
+  uint64_t oldest_ancester_time = 0;  // min non-zero oldest_ancester_time -> cold-SST fallback signal (unix seconds)
+  uint64_t sst_file_count = 0;        // number of SSTs overlapping the range
+
+  // ---- Phase-B: filled by MvccPropertiesCollector (default 0 when absent) ----
+  uint64_t num_versions = 0;               // total MVCC versions (one per write CF Put record)
+  uint64_t num_rows = 0;                    // distinct user_keys
+  uint64_t num_deletes = 0;                 // op=Delete WriteInfo Put records (dingo Delete markers)
+  uint64_t num_discardable = 0;             // estimated discardable records (reserved; computed later from above)
+  int64_t oldest_delete_ts = 0;            // min commit_ts among op=Delete records (0 = none)
+  int64_t newest_delete_ts = 0;            // max commit_ts among op=Delete records (0 = none)
+  int64_t oldest_stale_version_ts = 0;     // min commit_ts among non-newest versions (0 = none)
+  int64_t newest_stale_version_ts = 0;     // max commit_ts among non-newest versions (0 = none)
+};
+
 class RawEngine : public std::enable_shared_from_this<RawEngine> {
  public:
   virtual ~RawEngine() = default;
@@ -146,6 +181,18 @@ class RawEngine : public std::enable_shared_from_this<RawEngine> {
   virtual butil::Status CompactRange(const std::string& /*cf_name*/, const std::string& /*start_key*/,
                                      const std::string& /*end_key*/, bool /*force_bottommost*/) {
     return butil::Status(pb::error::ENOT_SUPPORT, "CompactRange is not supported by this engine");
+  }
+
+  // [GC-Tombstone baseline step-B1] Aggregate the table properties of all SSTs that overlap a key
+  // range of one CF (intended for the write CF). Used by the active-compaction scheduler to estimate
+  // a region's reclaimable garbage. start_key / end_key are already-encoded (EncodeBytes) physical
+  // keys; an empty string means an open bound (nullptr) on that side (same convention as CompactRange).
+  // Like CompactRange, this is intentionally NON-pure-virtual with a NotSupported default so only
+  // RocksRawEngine has to override it (xdprocks / bdb / mem fall back to the default and still compile,
+  // letting the scheduler gracefully skip them). On error returns a non-OK status; it never FATALs.
+  virtual butil::Status GetRangeTableProperties(const std::string& /*cf_name*/, const std::string& /*start_key*/,
+                                                const std::string& /*end_key*/, RangeTableProperties* /*out*/) {
+    return butil::Status(pb::error::ENOT_SUPPORT, "GetRangeTableProperties is not supported by this engine");
   }
 
  protected:

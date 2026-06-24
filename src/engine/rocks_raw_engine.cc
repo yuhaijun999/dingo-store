@@ -16,8 +16,10 @@
 
 #include <elf.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -35,6 +37,7 @@
 #include "common/helper.h"
 #include "common/logging.h"
 #include "config/config_helper.h"
+#include "engine/mvcc_properties_collector.h"
 #include "engine/raw_engine.h"
 #include "engine/snapshot.h"
 #include "engine/write_compaction_filter.h"
@@ -50,6 +53,7 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
 #include "rocksdb/write_batch.h"
 
 namespace dingodb {
@@ -991,6 +995,16 @@ static rocksdb::ColumnFamilyOptions GenRocksDBColumnFamilyOptions(rocks::ColumnF
     family_options.compaction_filter_factory = std::make_shared<WriteCompactionFilterFactory>();
   }
 
+  // [GC-Tombstone baseline step-B4] Register the write CF MVCC properties collector (default OFF via
+  // gflag). Only the txn write CF gets it; when gc_enable_mvcc_properties_collector is false this is a
+  // no-op and SST flush/compaction output is byte-for-byte identical to before. The collector persists
+  // MVCC stats into SST user properties so the phase-B active-compaction scheduler can estimate the
+  // discardable garbage of a region. The factory is stateless and shared; RocksDB creates one collector
+  // instance per output SST.
+  if (FLAGS_gc_enable_mvcc_properties_collector && column_family->Name() == Constant::kTxnWriteCF) {
+    family_options.table_properties_collector_factories.emplace_back(std::make_shared<MvccPropertiesCollectorFactory>());
+  }
+
   // [GC-Tombstone baseline step-3] Enable periodic compaction on the txn write CF so cold SSTs are
   // re-compacted (and thus pass through the filter) periodically. Default 0 -> do not touch the option
   // at all, keeping CF options byte-for-byte identical to before. Only the write CF is configured
@@ -1301,9 +1315,17 @@ butil::Status RocksRawEngine::CompactRange(const std::string& cf_name, const std
   options.exclusive_manual_compaction = false;
   options.allow_write_stall = false;
   options.max_subcompactions = 1;
-  // With the write CF filter registered, kIfHaveCompactionFilter already pulls in the bottommost level
-  // (where versions are physically reclaimed). kForce compacts the bottommost every time at the cost of
-  // large write amplification, used only when the caller explicitly asks.
+  // With the write CF filter registered, kIfHaveCompactionFilter pulls the bottommost level INTO this
+  // compaction (where versions are physically reclaimed). kForce compacts the bottommost every time at the
+  // cost of large write amplification, used only when the caller explicitly asks.
+  // [M3] CAUTION: neither option makes the CompactionFilter Context.is_full_compaction true for a per-range
+  // (sub-key-range) CompactRange. is_full_compaction means "this compaction includes ALL table files of the
+  // CF" (rocksdb/compaction_filter.h Context), which a region sub-range compaction does not. Pulling in /
+  // forcing the bottommost LEVEL is not the same as including ALL files of the CF. Therefore, when the
+  // WriteCompactionFilter gates Delete-marker removal on is_full_compaction
+  // (gc_compaction_filter_tombstone_require_full_compaction=true), this per-range CompactRange reclaims old
+  // MVCC versions but does NOT physically delete Delete tombstones; tombstone reclamation relies on a
+  // periodic full compaction or raft GC.
   options.bottommost_level_compaction = force_bottommost
                                             ? rocksdb::BottommostLevelCompaction::kForce
                                             : rocksdb::BottommostLevelCompaction::kIfHaveCompactionFilter;
@@ -1320,6 +1342,124 @@ butil::Status RocksRawEngine::CompactRange(const std::string& cf_name, const std
     DINGO_LOG(ERROR) << fmt::format("[rocksdb] compact range failed, column family {}, status {}", cf_name,
                                     status.ToString());
     return butil::Status(pb::error::EINTERNAL, "CompactRange column family %s failed", cf_name.c_str());
+  }
+
+  return butil::Status();
+}
+
+// [GC-Tombstone baseline step-B1] Parse the MvccPropertiesCollector (step-B4) user-collected
+// properties from one SST's TableProperties and accumulate them into `out`. Values are decimal ASCII
+// integers under the dingo.mvcc.* keys (see mvcc_properties_collector.h). Missing keys (old SSTs, or
+// the collector gflag is off) are skipped, leaving the phase-B fields at 0. Never throws / FATALs:
+// a malformed value is treated as 0 for that key.
+static void ParseMvccUserProperties(const rocksdb::UserCollectedProperties& props, RangeTableProperties* out) {
+  auto get_u64 = [&props](const char* key, uint64_t* dst) {
+    auto it = props.find(key);
+    if (it == props.end()) {
+      return;
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);  // NOLINT(runtime/int)
+    if (errno == 0 && end != it->second.c_str()) {
+      *dst += static_cast<uint64_t>(v);
+    }
+  };
+  // Track min (oldest) / max (newest) ts across SSTs; ignore 0 (means "none").
+  auto get_ts_min = [&props](const char* key, int64_t* dst) {
+    auto it = props.find(key);
+    if (it == props.end()) {
+      return;
+    }
+    char* end = nullptr;
+    long long v = std::strtoll(it->second.c_str(), &end, 10);  // NOLINT(runtime/int)
+    if (end != it->second.c_str() && v > 0 && (*dst == 0 || v < *dst)) {
+      *dst = static_cast<int64_t>(v);
+    }
+  };
+  auto get_ts_max = [&props](const char* key, int64_t* dst) {
+    auto it = props.find(key);
+    if (it == props.end()) {
+      return;
+    }
+    char* end = nullptr;
+    long long v = std::strtoll(it->second.c_str(), &end, 10);  // NOLINT(runtime/int)
+    if (end != it->second.c_str() && v > *dst) {
+      *dst = static_cast<int64_t>(v);
+    }
+  };
+
+  get_u64(kMvccPropNumVersions, &out->num_versions);
+  get_u64(kMvccPropNumRows, &out->num_rows);
+  get_u64(kMvccPropNumDeletes, &out->num_deletes);
+  get_ts_min(kMvccPropOldestDeleteTs, &out->oldest_delete_ts);
+  get_ts_max(kMvccPropNewestDeleteTs, &out->newest_delete_ts);
+  get_ts_min(kMvccPropOldestStaleVersionTs, &out->oldest_stale_version_ts);
+  get_ts_max(kMvccPropNewestStaleVersionTs, &out->newest_stale_version_ts);
+}
+
+butil::Status RocksRawEngine::GetRangeTableProperties(const std::string& cf_name, const std::string& start_key,
+                                                      const std::string& end_key, RangeTableProperties* out) {
+  if (out == nullptr) {
+    return butil::Status(pb::error::EINTERNAL, "out is null");
+  }
+  if (db_ == nullptr) {
+    return butil::Status(pb::error::EINTERNAL, "db is null");
+  }
+
+  auto column_family = GetColumnFamily(cf_name);
+  if (column_family == nullptr) {
+    return butil::Status(pb::error::EINTERNAL, "column family %s not found", cf_name.c_str());
+  }
+
+  // start_key / end_key are already-encoded (EncodeBytes) physical keys. An empty start is a valid open
+  // lower bound (empty Slice == smallest key). The Slice objects must outlive the call below.
+  //
+  // CAUTION: RocksDB's Range is [start, limit); an empty `limit` Slice is the SMALLEST key, NOT a max
+  // sentinel, so [start, "") is an EMPTY range and would match no SST. The last region (end_key == "")
+  // therefore cannot be expressed as an open upper bound here. We log it and proceed with the (empty)
+  // range -> the caller gets zero properties and conservatively will NOT select that region (safe
+  // direction: never over-compacts; only risk is the rightmost region not being score-selected via this
+  // path -- it is still covered by RocksDB natural compaction and the periodic compaction fallback).
+  // [TODO] cover the open-upper last region precisely (needs a reliable max-key sentinel for the encoded
+  // keyspace, or GetPropertiesOfAllTables filtered by start).
+  if (end_key.empty()) {
+    DINGO_LOG(WARNING) << fmt::format(
+        "[rocksdb] GetRangeTableProperties open upper bound (last region) on cf {} is not range-queryable; "
+        "returning empty properties (region will not be score-selected this round)",
+        cf_name);
+  }
+  rocksdb::Slice start_slice(start_key);
+  rocksdb::Slice limit_slice(end_key);
+  rocksdb::Range range(start_slice, limit_slice);
+
+  rocksdb::TablePropertiesCollection collection;
+  auto status = db_->GetPropertiesOfTablesInRange(column_family->GetHandle(), &range, 1, &collection);
+  if (!status.ok()) {
+    DINGO_LOG(ERROR) << fmt::format("[rocksdb] get properties of tables in range failed, column family {}, status {}",
+                                    cf_name, status.ToString());
+    return butil::Status(pb::error::EINTERNAL, "GetPropertiesOfTablesInRange column family %s failed", cf_name.c_str());
+  }
+
+  for (const auto& [file_name, tp] : collection) {
+    if (tp == nullptr) {
+      continue;
+    }
+    // ---- Phase-A: built-in TableProperties ----
+    out->num_entries += tp->num_entries;
+    out->num_deletions += tp->num_deletions;
+    out->num_range_deletions += tp->num_range_deletions;
+    out->sst_file_count += 1;
+    // This RocksDB build's TableProperties has no oldest_ancester_time field; creation_time is its
+    // equivalent (oldest ancestor key time, falling back to the compaction output file creation time).
+    // Use file_creation_time as a secondary fallback. Track the min non-zero value across SSTs.
+    uint64_t cold_time = tp->creation_time != 0 ? tp->creation_time : tp->file_creation_time;
+    if (cold_time != 0 && (out->oldest_ancester_time == 0 || cold_time < out->oldest_ancester_time)) {
+      out->oldest_ancester_time = cold_time;
+    }
+
+    // ---- Phase-B: MvccPropertiesCollector user properties (skipped if absent) ----
+    ParseMvccUserProperties(tp->user_collected_properties, out);
   }
 
   return butil::Status();

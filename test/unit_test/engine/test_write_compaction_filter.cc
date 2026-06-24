@@ -14,15 +14,26 @@
 
 // [GC-Tombstone] Unit tests for WriteCompactionFilter decision logic. These tests exercise the
 // FilterV2 remove_older_ state machine, the tombstone safety gate (is_full_compaction +
-// tombstone_require_full_compaction), and skip_until construction. NOTE: not run here (the user
-// compiles/runs the tests themselves), they only document the expected behavior.
+// is_manual_compaction + tombstone_require_full_compaction + tombstone_allow_manual_compaction), and
+// skip_until construction. NOTE: not run here (the user compiles/runs the tests themselves), they only
+// document the expected behavior.
 //
 // Constructor signature under test:
-//   WriteCompactionFilter(int64_t safe_point, bool is_full_compaction, bool tombstone_require_full_compaction)
+//   WriteCompactionFilter(int64_t safe_point, bool is_full_compaction, bool is_manual_compaction,
+//                         bool tombstone_require_full_compaction, bool tombstone_allow_manual_compaction)
 //
-// The tombstone policy is a CONSTRUCTOR snapshot, so most tests drive behavior purely through the two
+// The tombstone policy is a CONSTRUCTOR snapshot, so most tests drive behavior purely through the four
 // constructor bools and never touch the global FLAGS_. The factory-level interaction with
 // FLAGS_gc_compaction_filter_tombstone_require_full_compaction is covered by a dedicated guard below.
+//
+// [M3] The Delete-marker removal gate is:
+//   may_remove_tombstone = is_full_compaction
+//                          || (tombstone_allow_manual_compaction && is_manual_compaction)
+//                          || !tombstone_require_full_compaction
+// A manual CompactRange over a key range pulls in all levels for that range (bottommost included by the
+// registered filter), so removing a Delete marker for an in-range key is resurrection-safe even when
+// is_full_compaction is false -- but ONLY when explicitly opted in (allow_manual). Automatic leveled
+// compactions never benefit from allow_manual (is_manual_compaction is false there). See Group F.
 
 #include <gtest/gtest.h>
 
@@ -74,7 +85,9 @@ class WriteCompactionFilterTest : public testing::Test {
 // Non-Value entries (blob index / merge operand) are always kept.
 TEST_F(WriteCompactionFilterTest, NonValueKept) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Put), &skip_until, ValueType::kBlobIndex),
             Decision::kKeep);
@@ -83,7 +96,9 @@ TEST_F(WriteCompactionFilterTest, NonValueKept) {
 // Versions newer than safe_point are always kept.
 TEST_F(WriteCompactionFilterTest, AboveSafePointKept) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 200), MakeValue(pb::store::Op::Put), &skip_until), Decision::kKeep);
 }
@@ -92,7 +107,9 @@ TEST_F(WriteCompactionFilterTest, AboveSafePointKept) {
 // removed via kRemoveAndSkipUntil, and skip_until == EncodeKey(user_key, commit_ts-1) (same user_key).
 TEST_F(WriteCompactionFilterTest, FirstPutKeptOlderRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // Newest Put at/below safe_point: kept (protected first put).
@@ -116,7 +133,9 @@ TEST_F(WriteCompactionFilterTest, FirstPutKeptOlderRemoved) {
 // is then removable.
 TEST_F(WriteCompactionFilterTest, NewerVersionAboveSafePointDisablesProtection) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // Put above safe_point: kept, records that a newer Put/Delete exists.
@@ -131,7 +150,9 @@ TEST_F(WriteCompactionFilterTest, NewerVersionAboveSafePointDisablesProtection) 
 // compaction with the safety gate on, which is exactly this configuration.
 TEST_F(WriteCompactionFilterTest, FirstDeleteRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 90), MakeValue(pb::store::Op::Delete), &skip_until),
             Decision::kRemoveAndSkipUntil);
@@ -141,7 +162,9 @@ TEST_F(WriteCompactionFilterTest, FirstDeleteRemoved) {
 // A standalone Rollback at/below safe_point is removed via kRemove.
 TEST_F(WriteCompactionFilterTest, RollbackRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 90), MakeValue(pb::store::Op::Rollback), &skip_until), Decision::kRemove);
 }
@@ -149,7 +172,9 @@ TEST_F(WriteCompactionFilterTest, RollbackRemoved) {
 // Lock is NOT deleted (aligns with DoGcCoreTxn, which only logs and keeps it).
 TEST_F(WriteCompactionFilterTest, LockKept) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 90), MakeValue(pb::store::Op::Lock), &skip_until), Decision::kKeep);
 }
@@ -157,7 +182,9 @@ TEST_F(WriteCompactionFilterTest, LockKept) {
 // A key that fails to decode is conservatively kept (the filter must never crash a compaction thread).
 TEST_F(WriteCompactionFilterTest, DecodeFailureKept) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   std::string bad_key = "short";  // shorter than the minimum encoded key length
   EXPECT_EQ(Filter(filter, bad_key, MakeValue(pb::store::Op::Put), &skip_until), Decision::kKeep);
@@ -166,7 +193,9 @@ TEST_F(WriteCompactionFilterTest, DecodeFailureKept) {
 // commit_ts == 1 boundary: skip_until = EncodeKey(user_key, 0), which must be valid and not carry over.
 TEST_F(WriteCompactionFilterTest, CommitTsOneBoundary) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // Make ts=1 a removable older version by first consuming the protected first put at a higher ts.
@@ -187,7 +216,9 @@ TEST_F(WriteCompactionFilterTest, CommitTsOneBoundary) {
 // Crossing a user_key boundary resets the per-key state (a new key's first put is protected again).
 TEST_F(WriteCompactionFilterTest, UserKeyBoundaryResets) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   EXPECT_EQ(Filter(filter, MakeKey("k1", 90), MakeValue(pb::store::Op::Put), &skip_until), Decision::kKeep);
@@ -206,7 +237,9 @@ TEST_F(WriteCompactionFilterTest, UserKeyBoundaryResets) {
 // full=true, require_full=true -> safe to physically remove the marker.
 TEST_F(WriteCompactionFilterTest, FirstDeleteFullCompactionRequireFullRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until),
             Decision::kRemoveAndSkipUntil);
@@ -217,7 +250,9 @@ TEST_F(WriteCompactionFilterTest, FirstDeleteFullCompactionRequireFullRemoved) {
 // to keep shadowing any lower-level old version (prevents resurrection). This is the core fix.
 TEST_F(WriteCompactionFilterTest, FirstDeletePartialCompactionRequireFullKept) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until), Decision::kKeep);
   EXPECT_TRUE(skip_until.empty());  // kKeep never sets skip_until
@@ -227,7 +262,9 @@ TEST_F(WriteCompactionFilterTest, FirstDeletePartialCompactionRequireFullKept) {
 // partial compaction.
 TEST_F(WriteCompactionFilterTest, FirstDeletePartialCompactionNoRequireFullRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                               /*tombstone_require_full_compaction=*/false);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/false,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until),
             Decision::kRemoveAndSkipUntil);
@@ -244,7 +281,9 @@ TEST_F(WriteCompactionFilterTest, FirstDeletePartialCompactionNoRequireFullRemov
 // tombstone reclaim of the old data shadowed by the marker.
 TEST_F(WriteCompactionFilterTest, KeptTombstoneStillRemovesOlderBelow) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // First effective version is a Delete@50 -> kept (gate), remove_older_ now true.
@@ -261,7 +300,9 @@ TEST_F(WriteCompactionFilterTest, KeptTombstoneStillRemovesOlderBelow) {
 // older shadowed Delete is redundant because the newer Put already shadows it).
 TEST_F(WriteCompactionFilterTest, OlderDeleteBelowKeptPutRemoved) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // First effective version Put@50 -> kept (no newer above), remove_older_ now true.
@@ -277,7 +318,9 @@ TEST_F(WriteCompactionFilterTest, OlderDeleteBelowKeptPutRemoved) {
 // the Put treated as the FIRST effective version (kept), not as a redundant older version.
 TEST_F(WriteCompactionFilterTest, RollbackDoesNotShadowLowerPut) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // Rollback@50 -> removed self only (kRemove), remove_older_ stays false.
@@ -293,7 +336,9 @@ TEST_F(WriteCompactionFilterTest, RollbackDoesNotShadowLowerPut) {
 // This confirms Rollback is transparent to BOTH the remove_older_ and the seen_above logic.
 TEST_F(WriteCompactionFilterTest, RollbackTransparentWithNewerAbove) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // Newer Put above safe_point -> kept, sets seen_put_or_delete_above_sp_.
@@ -317,9 +362,13 @@ TEST_F(WriteCompactionFilterTest, FullCompactionEquivalentAcrossFlag) {
   std::string skip_a;
   std::string skip_b;
   WriteCompactionFilter filter_a(/*safe_point=*/100, /*is_full_compaction=*/true,
-                                 /*tombstone_require_full_compaction=*/true);
+                                 /*is_manual_compaction=*/false,
+                                 /*tombstone_require_full_compaction=*/true,
+                                 /*tombstone_allow_manual_compaction=*/false);
   WriteCompactionFilter filter_b(/*safe_point=*/100, /*is_full_compaction=*/true,
-                                 /*tombstone_require_full_compaction=*/false);
+                                 /*is_manual_compaction=*/false,
+                                 /*tombstone_require_full_compaction=*/false,
+                                 /*tombstone_allow_manual_compaction=*/false);
 
   EXPECT_EQ(Filter(filter_a, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_a),
             Filter(filter_b, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_b));
@@ -334,7 +383,9 @@ TEST_F(WriteCompactionFilterTest, FullCompactionEquivalentAcrossFlag) {
 // compaction thread by feeding a negative ts to the encoder).
 TEST_F(WriteCompactionFilterTest, CommitTsZeroDefensiveKeep) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
   EXPECT_EQ(Filter(filter, MakeKey("k1", 0), MakeValue(pb::store::Op::Put), &skip_until), Decision::kKeep);
   EXPECT_TRUE(skip_until.empty());
@@ -345,7 +396,9 @@ TEST_F(WriteCompactionFilterTest, CommitTsZeroDefensiveKeep) {
 // proving the per-key state is reset rather than carried over.
 TEST_F(WriteCompactionFilterTest, UserKeyBoundaryResetsTombstoneState) {
   WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                               /*tombstone_require_full_compaction=*/true);
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
   std::string skip_until;
 
   // k1: Put@50 kept -> remove_older_=true; Put@40 dropped.
@@ -375,7 +428,9 @@ TEST_F(WriteCompactionFilterTest, FactoryFlagSnapshotReproducesGate) {
   FLAGS_gc_compaction_filter_tombstone_require_full_compaction = true;
   {
     WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction);
+                                 /*is_manual_compaction=*/false,
+                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction,
+                                 /*tombstone_allow_manual_compaction=*/false);
     std::string skip_until;
     EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until), Decision::kKeep);
   }
@@ -384,7 +439,9 @@ TEST_F(WriteCompactionFilterTest, FactoryFlagSnapshotReproducesGate) {
   FLAGS_gc_compaction_filter_tombstone_require_full_compaction = false;
   {
     WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
-                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction);
+                                 /*is_manual_compaction=*/false,
+                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction,
+                                 /*tombstone_allow_manual_compaction=*/false);
     std::string skip_until;
     EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until),
               Decision::kRemoveAndSkipUntil);
@@ -393,5 +450,105 @@ TEST_F(WriteCompactionFilterTest, FactoryFlagSnapshotReproducesGate) {
   // Restore the global flag to its pre-test value.
   FLAGS_gc_compaction_filter_tombstone_require_full_compaction = saved;
 }
+
+// ===========================================================================================
+// Group F: [M3] manual-compaction tombstone gate.
+// The new gate adds an opt-in path that lets a manual CompactRange remove a Delete marker even on a
+// non-full compaction:
+//   may_remove_tombstone = is_full || (allow_manual && is_manual) || !require_full
+// These tests drive the gate purely through constructor params (the policy is a constructor snapshot),
+// so they never touch FLAGS_ and need no FlagGuard. Each case isolates one axis of the gate.
+// ===========================================================================================
+
+// is_full=false, is_manual=true, require_full=true, allow_manual=true:
+// A manual CompactRange covers all levels of its key range, so the marker can be physically removed even
+// though is_full_compaction is false. Expect kRemoveAndSkipUntil with skip_until = EncodeKey(k1, ts-1).
+TEST_F(WriteCompactionFilterTest, ManualCompactionRemovesTombstoneWhenAllowed) {
+  WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
+                               /*is_manual_compaction=*/true,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/true);
+  std::string skip_until;
+  std::string key50 = MakeKey("k1", 50);
+  EXPECT_EQ(Filter(filter, key50, MakeValue(pb::store::Op::Delete), &skip_until), Decision::kRemoveAndSkipUntil);
+  EXPECT_EQ(skip_until, MakeKey("k1", 49));
+  EXPECT_GT(skip_until, key50);  // descending ts encoding: commit_ts-1 encodes to larger bytes
+
+  // skip_until must stay within the same user_key (not cross the boundary).
+  std::string decoded_user_key;
+  int64_t decoded_ts = 0;
+  ASSERT_TRUE(mvcc::Codec::DecodeKey(skip_until, decoded_user_key, decoded_ts));
+  EXPECT_EQ(decoded_user_key, "k1");
+  EXPECT_EQ(decoded_ts, 49);
+}
+
+// is_full=false, is_manual=true, require_full=true, allow_manual=false:
+// The manual path is opt-in; with allow_manual off a manual compaction is treated like any partial
+// compaction -> the first Delete marker MUST be kept to shadow any lower-level old version.
+TEST_F(WriteCompactionFilterTest, ManualCompactionKeepsTombstoneWhenNotAllowed) {
+  WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
+                               /*is_manual_compaction=*/true,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
+  std::string skip_until;
+  EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until), Decision::kKeep);
+  EXPECT_TRUE(skip_until.empty());  // kKeep never sets skip_until
+}
+
+// is_full=false, is_manual=false, require_full=true, allow_manual=true:
+// CRITICAL: allow_manual only takes effect when is_manual_compaction is true. An AUTOMATIC leveled
+// compaction (is_manual=false) does NOT cover all levels, so even with allow_manual=true the marker MUST
+// be kept to prevent resurrection. This proves allow_manual is scoped to manual compactions only.
+TEST_F(WriteCompactionFilterTest, AutoCompactionKeepsTombstoneEvenIfAllowManual) {
+  WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/false,
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/true);
+  std::string skip_until;
+  EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until), Decision::kKeep);
+  EXPECT_TRUE(skip_until.empty());
+}
+
+// is_full=true, is_manual=false, require_full=true, allow_manual=false:
+// is_full_compaction is the first (highest-priority) term of the gate, so a full compaction removes the
+// marker regardless of the manual axis. Confirms M3 did not regress the original full-compaction path.
+TEST_F(WriteCompactionFilterTest, FullCompactionStillRemovesRegardlessOfManual) {
+  WriteCompactionFilter filter(/*safe_point=*/100, /*is_full_compaction=*/true,
+                               /*is_manual_compaction=*/false,
+                               /*tombstone_require_full_compaction=*/true,
+                               /*tombstone_allow_manual_compaction=*/false);
+  std::string skip_until;
+  EXPECT_EQ(Filter(filter, MakeKey("k1", 50), MakeValue(pb::store::Op::Delete), &skip_until),
+            Decision::kRemoveAndSkipUntil);
+  EXPECT_EQ(skip_until, MakeKey("k1", 49));
+}
+
+// ===========================================================================================
+// [E2E GAP] Real multi-level RocksDB resurrection test -- NOT covered by this unit suite.
+// -------------------------------------------------------------------------------------------
+// These FilterV2 tests verify the per-callback DECISION in isolation; they do NOT prove the end-to-end
+// physical effect: that a per-region force_bottommost CompactRange with allow_manual=true actually
+// makes a Delete marker (and the data it shadows) physically disappear AND that a subsequent read
+// returns "deleted" (no resurrection of a lower-level old Put).
+//
+// There is currently no real-compaction harness in this file (no rocksdb::DB instance, no LSM with
+// populated lower levels). Building one here would require:
+//   1. Open a real rocksdb::DB with the write CF, install WriteCompactionFilterFactory, and set the
+//      global safe_point (g_compaction_filter_safe_point) + gc_enable_compaction_filter.
+//   2. Force a layered LSM for one user_key: write an old Put@T1 (commit_ts < safe_point), Flush to push
+//      it to a lower level (e.g. via SetOptions/CompactRange or num_levels + manual flush), then write a
+//      Delete marker@T2 (T1 < T2 <= safe_point) and Flush it to a HIGHER level so the Put lives in a
+//      level NOT included by a partial compaction.
+//   3. Set gc_compaction_filter_tombstone_allow_manual_compaction=true and issue a per-region
+//      CompactRange with CompactRangeOptions.bottommost_level_compaction =
+//      BottommostLevelCompaction::kForce (the "force_bottommost" path) over the region key range.
+//   4. Assert via DB::Get / an iterator over the write CF that BOTH the Delete marker AND the old Put
+//      are physically gone, and that a txn read at a ts above T2 sees the key as deleted (not the old
+//      Put resurrected).
+//   5. Negative control: repeat with allow_manual=false (or an automatic compaction) and assert the
+//      marker is still present (kept), confirming the gate.
+// Recommended location: a new test/unit_test/engine/test_write_compaction_filter_e2e.cc (or an
+// integration test) so it can link the real RocksDB engine; keep this decision-logic suite pure/fast.
+// ===========================================================================================
 
 }  // namespace dingodb

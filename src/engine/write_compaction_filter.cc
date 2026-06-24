@@ -42,6 +42,15 @@ DEFINE_bool(gc_compaction_filter_tombstone_require_full_compaction, true,
             "only physically remove a Delete tombstone during a full compaction (default true, safe); "
             "false restores the old unconditional removal (DANGEROUS, can resurrect deleted data)");
 
+// [M3] Also allow removing a Delete tombstone during a MANUAL compaction (CompactRange), not just a full
+// one. Default false (unchanged). Safe because a manual CompactRange over a key range compacts all levels
+// of that range (and the bottommost is pulled in by the registered filter), so all versions of an in-range
+// key are present -> no resurrection. Lets the active per-region CompactRange reclaim Delete markers. See
+// the header DECLARE comment for the full rationale and the CompactFiles caveat.
+DEFINE_bool(gc_compaction_filter_tombstone_allow_manual_compaction, false,
+            "also physically remove a Delete tombstone during a manual CompactRange (default false); safe "
+            "because manual range compaction covers all levels of the range (no resurrection)");
+
 std::atomic<int64_t> g_compaction_filter_safe_point{0};
 std::atomic<bool> g_compaction_filter_gc_stop{false};
 
@@ -150,7 +159,12 @@ rocksdb::CompactionFilter::Decision WriteCompactionFilter::FilterV2(int /*level*
       // removed unconditionally (DANGEROUS, old behavior). NOTE: only removing the marker ITSELF needs the
       // gate -- older versions below it are still reclaimed via the remove_older_ branch above (the kept
       // marker shadows them), so non-full compactions still get the zero-tombstone reclaim of old data.
-      const bool may_remove_tombstone = is_full_compaction_ || !tombstone_require_full_compaction_;
+      // [M3] A manual CompactRange also covers all levels of its key range (bottommost pulled in by the
+      // registered filter), so for an in-range key all versions are present -> removing the marker is
+      // resurrection-safe even though is_full_compaction is false. Gated by the opt-in flag (default off).
+      const bool may_remove_tombstone = is_full_compaction_ ||
+                                        (tombstone_allow_manual_compaction_ && is_manual_compaction_) ||
+                                        !tombstone_require_full_compaction_;
       if (may_remove_tombstone) {
         *skip_until = mvcc::Codec::EncodeKey(std::string_view(user_key), commit_ts - 1);
         return Decision::kRemoveAndSkipUntil;
@@ -187,12 +201,15 @@ std::unique_ptr<rocksdb::CompactionFilter> WriteCompactionFilterFactory::CreateC
   if (safe_point <= 0) {
     return nullptr;
   }
-  // Snapshot the tombstone policy flag once per compaction so all versions of a user_key in this
-  // compaction use a consistent policy even if the flag is flipped mid-run. is_full_compaction tells the
-  // filter whether this compaction's view is complete (safe to remove Delete markers). is_manual_compaction
-  // and input_start_level are intentionally unused: neither implies a complete view of all MVCC versions.
+  // Snapshot the tombstone policy flags once per compaction so all versions of a user_key in this
+  // compaction use a consistent policy even if a flag is flipped mid-run. is_full_compaction tells the
+  // filter whether this compaction's view is complete; [M3] is_manual_compaction additionally signals a
+  // CompactRange (covers all levels of its key range -> also safe to remove Delete markers when the
+  // allow_manual flag is on). input_start_level is intentionally unused (does not imply a complete view).
   return std::make_unique<WriteCompactionFilter>(safe_point, context.is_full_compaction,
-                                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction);
+                                                 context.is_manual_compaction,
+                                                 FLAGS_gc_compaction_filter_tombstone_require_full_compaction,
+                                                 FLAGS_gc_compaction_filter_tombstone_allow_manual_compaction);
 }
 
 }  // namespace dingodb

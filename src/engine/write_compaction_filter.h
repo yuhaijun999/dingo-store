@@ -71,6 +71,18 @@ DECLARE_bool(gc_enable_compaction_filter);
 // kept only for A/B comparison and debugging).
 DECLARE_bool(gc_compaction_filter_tombstone_require_full_compaction);
 
+// [M3] Allow removing a Delete marker during a MANUAL compaction too (not only a full one). Default
+// false (unchanged behavior). Rationale: a manual CompactRange(begin,end) compacts the key range across
+// ALL levels (RocksDB manual-compaction semantics) and, because the write CF has a compaction filter
+// registered, the bottommost level is pulled in (kIfHaveCompactionFilter / kForce). So for any user_key
+// in the range, ALL of its versions are in this compaction's input -> removing the marker cannot expose
+// a lower-level older version (no resurrection), even though Context.is_full_compaction is false for a
+// sub-range. This lets the active per-region CompactRange physically reclaim Delete markers.
+// CAVEAT: Context.is_manual_compaction is also true for CompactFiles (a user-chosen file subset that may
+// NOT cover all levels of a key). dingo does NOT use CompactFiles for compaction (only IngestExternalFile,
+// which does not run this delete path), so is_manual_compaction here is effectively CompactRange == safe.
+DECLARE_bool(gc_compaction_filter_tombstone_allow_manual_compaction);
+
 // Process-level safe_point shared with the filter. Refreshed every GC poll round from tenant 0's
 // safe_point (RegularDoGcHandler), monotonically increasing. The filter only drops versions whose
 // commit_ts <= this value. 0 means "not ready / do not GC".
@@ -91,10 +103,13 @@ class WriteCompactionFilter : public rocksdb::CompactionFilter {
   // is a snapshot of FLAGS_gc_compaction_filter_tombstone_require_full_compaction taken at construction,
   // so a mid-compaction flag flip cannot make different versions of the same user_key use inconsistent
   // tombstone policy.
-  WriteCompactionFilter(int64_t safe_point, bool is_full_compaction, bool tombstone_require_full_compaction)
+  WriteCompactionFilter(int64_t safe_point, bool is_full_compaction, bool is_manual_compaction,
+                        bool tombstone_require_full_compaction, bool tombstone_allow_manual_compaction)
       : safe_point_(safe_point),
         is_full_compaction_(is_full_compaction),
-        tombstone_require_full_compaction_(tombstone_require_full_compaction) {}
+        is_manual_compaction_(is_manual_compaction),
+        tombstone_require_full_compaction_(tombstone_require_full_compaction),
+        tombstone_allow_manual_compaction_(tombstone_allow_manual_compaction) {}
 
   const char* Name() const override { return "DingoWriteCompactionFilter"; }
 
@@ -112,9 +127,19 @@ class WriteCompactionFilter : public rocksdb::CompactionFilter {
   // Only then is it safe to physically remove a Delete marker (no lower-level version can resurrect).
   const bool is_full_compaction_;
 
+  // [M3] Whether this compaction was triggered by an explicit CompactRange/CompactFiles call
+  // (Context.is_manual_compaction). A manual CompactRange over a key range includes all levels for that
+  // range, so removing a Delete marker is also resurrection-safe (see DECLARE comment + factory).
+  const bool is_manual_compaction_;
+
   // Snapshot of the tombstone safety flag (see header DECLARE comment). When true, a Delete marker is
-  // removed only if is_full_compaction_; when false, removed unconditionally (DANGEROUS, old behavior).
+  // removed only if is_full_compaction_ (or, per the flag below, a manual compaction); when false, removed
+  // unconditionally (DANGEROUS, old behavior).
   const bool tombstone_require_full_compaction_;
+
+  // [M3] Snapshot of gc_compaction_filter_tombstone_allow_manual_compaction. When true, a Delete marker
+  // may also be removed during a manual compaction (is_manual_compaction_), not just a full one.
+  const bool tombstone_allow_manual_compaction_;
 
   // Current user_key being processed; used to detect a user_key boundary and reset the per-key state.
   mutable std::string mvcc_key_prefix_;

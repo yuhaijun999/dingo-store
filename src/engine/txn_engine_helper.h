@@ -371,6 +371,10 @@ class TxnEngineHelper {
 
   static void RegularUpdateSafePointTsHandler(void *arg);
   static void RegularDoGcHandler(void *arg);
+  // [GC-Tombstone refactor B3] Independent score-based active compaction scheduler crontab handler.
+  // Runs on its own crontab task (gc_active_compaction_check_interval_s) decoupled from raft GC; gated by
+  // gc_active_compaction_score_based. Single-instance guarded internally; safe to call when disabled.
+  static void ActiveCompactionHandler(void *arg);
 
   static int64_t GenFinalMinCommitTs(store::RegionPtr region, pb::store::LockInfo &lock_info, std::string key,
                                      int64_t start_ts, int64_t for_update_ts, int64_t max_commit_ts);

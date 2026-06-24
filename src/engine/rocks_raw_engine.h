@@ -291,6 +291,10 @@ class RocksRawEngine : public RawEngine {
   // [GC-Tombstone baseline step-4] Range-scoped manual compaction (see RawEngine::CompactRange).
   butil::Status CompactRange(const std::string& cf_name, const std::string& start_key, const std::string& end_key,
                              bool force_bottommost) override;
+  // [GC-Tombstone baseline step-B1] Aggregate SST table properties over a key range (see
+  // RawEngine::GetRangeTableProperties). Wraps DB::GetPropertiesOfTablesInRange.
+  butil::Status GetRangeTableProperties(const std::string& cf_name, const std::string& start_key,
+                                        const std::string& end_key, RangeTableProperties* out) override;
 
   std::vector<int64_t> GetApproximateSizes(const std::string& cf_name, std::vector<pb::common::Range>& ranges) override;
 

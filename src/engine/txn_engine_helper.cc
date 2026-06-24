@@ -39,6 +39,7 @@
 #include "common/uuid.h"
 #include "coprocessor/coprocessor_v2.h"
 #include "document/codec.h"
+#include "engine/active_compaction_scheduler.h"
 #include "engine/gc_safe_point.h"
 #include "engine/gc_task_tracker.h"
 #include "engine/rocks_raw_engine.h"
@@ -99,10 +100,48 @@ DEFINE_int64(gc_active_compaction_every_n_rounds, 5,
 DEFINE_int64(gc_active_compaction_round_budget_ms, 30000,
              "per-round total time budget (ms) for active compaction; stop issuing once used up");
 DEFINE_int64(gc_active_compaction_max_per_round, 16, "max number of CompactRange calls issued per GC round");
+// [M4] Top-N scoring-stage heap capacity, decoupled from max_per_round. TiKV sizes its candidate heap by
+// max(check_interval_secs, 10) (~300 at the default 300s interval, compaction_runner.rs:330-331) so the
+// scoring stage keeps far more candidates than a single round will actually compact, then the compact
+// stage applies max_per_round as the real issue cap. Binding the heap to max_per_round (=16) double-
+// truncates and discards the 17th+ candidate at scoring time. Default 300 to mirror TiKV; 0 falls back to
+// using max_per_round (old behavior).
+DEFINE_int64(gc_active_compaction_topn_capacity, 300,
+             "scoring-stage Top-N candidate heap capacity (mirrors TiKV ~max(check_interval,10)); the "
+             "compact stage still caps actual CompactRange calls at gc_active_compaction_max_per_round; "
+             "0 = fall back to gc_active_compaction_max_per_round");
 DEFINE_int64(gc_active_compaction_min_interval_s, 3600,
              "min interval (s) between two active compactions of the same region");
+// [M3] NOTE on tombstone reclamation: a per-region CompactRange is a sub-key-range compaction, so the
+// CompactionFilter Context.is_full_compaction is normally FALSE (is_full_compaction = "includes ALL table
+// files of the CF"). Forcing the bottommost LEVEL here is NOT the same as a full compaction. When the
+// WriteCompactionFilter requires a full compaction to drop Delete markers
+// (gc_compaction_filter_tombstone_require_full_compaction=true), active compaction reclaims old MVCC
+// versions but does NOT physically delete Delete tombstones; tombstone reclamation then relies on periodic
+// full compaction / raft GC. Default kept at false (no silent write-amp); the limitation is logged as a
+// WARN in ActiveCompactionHandler.
 DEFINE_bool(gc_active_compaction_force_bottommost, false,
-            "force active CompactRange down to the bottommost level (higher write amp, more thorough)");
+            "force active CompactRange down to the bottommost level (higher write amp, more thorough); does "
+            "NOT make Context.is_full_compaction true for a per-region sub-range compaction");
+
+// [GC-Tombstone refactor B2/B3/B5] Score-based active compaction scheduler gflags. ALL conservative /
+// default off. When gc_active_compaction_score_based=false (default) the new independent scheduler is
+// disabled and the old inline path in RegularDoGcHandler is used (one-flag hot rollback).
+DEFINE_bool(gc_active_compaction_score_based, false,
+            "master gate: true = independent score-based Top-N active compaction scheduler "
+            "(ActiveCompactionHandler); false = old inline lexicographic path after raft GC (default off)");
+DEFINE_int64(gc_active_compaction_tombstones_num_threshold, 10000,
+             "phase-A (filter-off) score gate: min RocksDB tombstone/garbage entry count to select a region");
+DEFINE_int64(gc_active_compaction_tombstones_percent_threshold, 30,
+             "phase-A (filter-off) score gate: min garbage percent (0-100) to select a region");
+DEFINE_int64(gc_active_compaction_redundant_rows_threshold, 50000,
+             "phase-B (filter-on) score gate: min discardable redundant MVCC version count to select a region");
+DEFINE_int64(gc_active_compaction_redundant_rows_percent_threshold, 20,
+             "phase-B (filter-on) score gate: min redundant percent (0-100) to select a region");
+DEFINE_int64(gc_active_compaction_cold_sst_seconds, 86400,
+             "phase-A cold-SST fallback: SSTs older than this (seconds) make a large region selectable even "
+             "without visible tombstones; 0 = disable cold fallback");
+DEFINE_validator(gc_active_compaction_score_based, &PassBool);
 
 // [GC-Tombstone baseline step-6] Read-path SEEK_BOUND adaptive seek. Default OFF (pure Next() as today).
 // When on, while skipping the old versions of one user_key, after txn_scan_seek_bound Next() calls still
@@ -6606,10 +6645,13 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
       continue;
     }
 
-    // [GC-Tombstone baseline step-5] L1 active compaction hook: this region's raft GC just succeeded and
-    // GC is not stopped, so actively compact its write CF range to feed the compaction filter. Fully
-    // gated and throttled; with gc_enable_active_compaction off (default) this whole block is a no-op.
-    if (FLAGS_gc_enable_active_compaction && status.ok()) {
+    // [GC-Tombstone baseline step-5 / refactor B3] L1 inline active compaction hook (OLD path, rollback).
+    // This region's raft GC just succeeded; compact its write CF range to feed the compaction filter.
+    // When gc_active_compaction_score_based=true the independent ActiveCompactionHandler owns active
+    // compaction and this inline path is suppressed (cold-region decoupling). When false (default) the old
+    // inline behavior is preserved verbatim -> one-flag hot rollback. Still also gated by the master
+    // gc_enable_active_compaction switch.
+    if (!FLAGS_gc_active_compaction_score_based && FLAGS_gc_enable_active_compaction && status.ok()) {
       RawEnginePtr active_compaction_raw_engine =
           storage->GetRawEngine(ctx->StoreEngineType(), ctx->RawEngineType());
       if (active_compaction_raw_engine != nullptr) {
@@ -6625,6 +6667,129 @@ void TxnEngineHelper::RegularDoGcHandler(void * /*arg*/) {
   }
 
   DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail) << fmt::format("[txn_gc] gc task end.");
+}
+
+// [GC-Tombstone refactor B3] Independent score-based active compaction scheduler. Runs on its own
+// crontab task (gc_active_compaction_check_interval_s) decoupled from raft GC. It does NOT require a
+// region's raft GC to have just succeeded; a region is selected purely by its write CF SST garbage, so
+// cold regions are covered. Single-instance guarded; never FATAL (failures are WARNING + skip). With
+// gc_active_compaction_score_based off (default) it returns immediately and the old inline path in
+// RegularDoGcHandler is used instead.
+void TxnEngineHelper::ActiveCompactionHandler(void * /*arg*/) {
+  // Master gate (rollback): off by default -> the old inline path stays in charge.
+  if (!FLAGS_gc_active_compaction_score_based || !FLAGS_gc_enable_active_compaction) {
+    return;
+  }
+
+  static std::atomic<bool> g_active_compaction_handler_running(false);
+  if (g_active_compaction_handler_running.load(std::memory_order_relaxed)) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail)
+        << "[active_compaction] previous round still running, skip";
+    return;
+  }
+  AtomicGuard guard(g_active_compaction_handler_running);
+
+  const int64_t round_begin_ms = Helper::TimestampMs();
+
+  // Read the GC safe_point shared with the write CF compaction filter (refreshed by RegularDoGcHandler,
+  // the same value the filter uses). 0 / gc stopped -> skip this round. This decouples scheduling from
+  // whether raft GC just ran while keeping the safe_point coherent with reclamation.
+  if (g_compaction_filter_gc_stop.load(std::memory_order_acquire)) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail) << "[active_compaction] gc stopped, skip round";
+    return;
+  }
+  const int64_t gc_safe_point = g_compaction_filter_safe_point.load(std::memory_order_acquire);
+  if (gc_safe_point <= 0) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail)
+        << "[active_compaction] safe_point not ready (0), skip round";
+    return;
+  }
+
+  // [M3] Make the per-region CompactRange tombstone-reclaim limitation explicit instead of silently no-op.
+  // A per-region CompactRange(start,end) only compacts the SST files overlapping that sub-range, so the
+  // RocksDB CompactionFilter Context.is_full_compaction is normally FALSE (is_full_compaction means "this
+  // compaction includes ALL table files of the CF", see rocksdb/compaction_filter.h Context). When the
+  // WriteCompactionFilter requires a full compaction to drop Delete markers
+  // (gc_compaction_filter_tombstone_require_full_compaction=true) AND the [M3] manual-compaction path is
+  // off (gc_compaction_filter_tombstone_allow_manual_compaction=false), active compaction reclaims old MVCC
+  // versions but does NOT physically delete the Delete (tombstone) markers, because a per-region
+  // CompactRange is not a full compaction (Context.is_full_compaction=false). In that case markers are
+  // reclaimed only by a periodic full compaction or by raft GC. NOTE: force_bottommost does NOT make
+  // is_full_compaction true; the knob that lets active compaction reclaim markers is now the M3 manual flag.
+  // Warn so the operator can enable it knowingly. This does not change the filter gating or any default.
+  if (FLAGS_gc_enable_compaction_filter && FLAGS_gc_compaction_filter_tombstone_require_full_compaction &&
+      !FLAGS_gc_compaction_filter_tombstone_allow_manual_compaction) {
+    DINGO_LOG(WARNING) << "[active_compaction] gc_compaction_filter_tombstone_require_full_compaction=true "
+                          "and gc_compaction_filter_tombstone_allow_manual_compaction=false: per-region "
+                          "CompactRange is NOT a full compaction (Context.is_full_compaction=false), so "
+                          "Delete tombstones will NOT be reclaimed by active compaction (only old versions "
+                          "are); tombstone reclamation relies on periodic full compaction / raft GC. Set "
+                          "gc_compaction_filter_tombstone_allow_manual_compaction=true to let active "
+                          "compaction reclaim markers (resurrection-safe for manual range compaction).";
+  }
+
+  std::shared_ptr<StoreMetaManager> store_meta_manager = Server::GetInstance().GetStoreMetaManager();
+  std::shared_ptr<GCSafePointManager> gc_safe_point_manager = store_meta_manager->GetGCSafePointManager();
+  std::map<int64_t, std::pair<bool, int64_t>> safe_point_ts_group =
+      gc_safe_point_manager->GetAllGcFlagAndSafePointTs();
+
+  std::shared_ptr<Storage> storage = Server::GetInstance().GetStorage();
+  if (storage == nullptr) {
+    return;
+  }
+
+  // [tikv-compaction 4.7] Active compaction traverses ALL replicas on this node, NOT leader-only and NOT
+  // filtered by region state. Unlike the raft GC in RegularDoGcHandler (logical GC, leader-only), active
+  // compaction is a LOCAL PHYSICAL operation: every replica (leader or follower) accumulates its own
+  // garbage in its own RocksDB, and safe_point is global so no cross-replica coordination is needed --
+  // compacting only leaders would leave follower replicas' garbage unreclaimed. The only filters kept are
+  // "alive on this node" (GetAllAliveRegion already excludes destroyed regions) and "the tenant has a GC
+  // safe_point". Region state (split/merge/applying/uninitialized) is intentionally NOT filtered: an
+  // uninitialized/empty region naturally scores 0 and is not selected; a region whose range is changing is
+  // still safe to CompactRange by physical key range (worst case a wasted compaction); per-region errors
+  // are contained by the scheduler (warn/continue) and a pre-compaction re-check skips stale candidates.
+  std::vector<store::RegionPtr> region_ptrs = Server::GetInstance().GetAllAliveRegion();
+  std::vector<store::RegionPtr> target_region_ptrs;
+  target_region_ptrs.reserve(region_ptrs.size());
+  RawEnginePtr raw_engine;
+  for (auto &region_ptr : region_ptrs) {
+    auto definition = region_ptr->Definition();
+    int64_t tenant_id = definition.tenant_id();
+    if (safe_point_ts_group.find(tenant_id) == safe_point_ts_group.end()) {
+      continue;
+    }
+    target_region_ptrs.push_back(region_ptr);
+    if (raw_engine == nullptr) {
+      raw_engine = storage->GetRawEngine(region_ptr->GetStoreEngineType(), region_ptr->GetRawEngineType());
+    }
+  }
+
+  if (target_region_ptrs.empty() || raw_engine == nullptr) {
+    DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail)
+        << "[active_compaction] no eligible region / raw engine, skip round";
+    return;
+  }
+
+  // [M4] Scoring-stage heap capacity is decoupled from the per-round issue cap (max_per_round). Use
+  // gc_active_compaction_topn_capacity (default 300, mirrors TiKV max(check_interval,10)); 0 falls back to
+  // max_per_round. max_per_round still bounds the actual CompactRange calls in CompactCandidates, so a
+  // large heap only keeps more candidates ranked, it does not increase write amp this round.
+  int64_t topn_capacity = FLAGS_gc_active_compaction_topn_capacity;
+  if (topn_capacity <= 0) {
+    topn_capacity = FLAGS_gc_active_compaction_max_per_round;
+  }
+  const size_t heap_capacity = topn_capacity > 0 ? static_cast<size_t>(topn_capacity) : 1;
+  std::vector<CompactionCandidate> candidates =
+      ActiveCompactionScheduler::CollectCompactionCandidates(raw_engine, target_region_ptrs, gc_safe_point,
+                                                             heap_capacity);
+
+  const int64_t round_deadline_ms = Helper::TimestampMs() + FLAGS_gc_active_compaction_round_budget_ms;
+  int issued = 0;
+  ActiveCompactionScheduler::CompactCandidates(raw_engine, candidates, round_deadline_ms, issued);
+
+  DINGO_LOG_IF(INFO, FLAGS_dingo_log_switch_txn_gc_detail) << fmt::format(
+      "[active_compaction] round done: regions={} candidates={} issued={} took_ms={}", target_region_ptrs.size(),
+      candidates.size(), issued, Helper::TimestampMs() - round_begin_ms);
 }
 
 // backup & restore
